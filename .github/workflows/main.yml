@@ -1,7 +1,10 @@
 name: PrizePicks Tracker
+
 on:
   schedule:
+    # Runs every hour at the 0 minute mark
     - cron: '0 * * * *'
+  # Enables the "Run workflow" button in the GitHub Actions tab
   workflow_dispatch:
 
 jobs:
@@ -19,11 +22,12 @@ jobs:
       - name: Install Dependencies
         run: |
           python -m pip install --upgrade pip
-          # We are now using curl_cffi for the 403 bypass
-          pip install curl_cffi discord-webhook
+          # curl_cffi for proxy bypass, requests for scrape.do, discord-webhook for alerts
+          pip install curl_cffi discord-webhook requests
 
- - name: Run Script
+      - name: Run Script
         env:
           DISCORD_WEBHOOK: ${{ secrets.DISCORD_WEBHOOK }}
+          PROXY_URL: ${{ secrets.PROXY_URL }}
           SCRAPE_DO_TOKEN: ${{ secrets.SCRAPE_DO_TOKEN }}
         run: python main.py
