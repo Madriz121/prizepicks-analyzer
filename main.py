@@ -7,8 +7,8 @@ def get_data():
     token = os.getenv("SCRAPE_DO_TOKEN")
     target_url = "https://api.prizepicks.com/projections?league_id=7"
     
-    # NEW logic: super=true (Residential IP) + render=true (Solves Cloudflare)
-    # This is the strongest possible bypass offered by Scrape.do
+    # Logic: super=true (Residential IP) + render=true (Solves Cloudflare)
+    # These parameters ensure the highest success rate against PrizePicks security.
     api_url = f"https://api.scrape.do?token={token}&url={target_url}&render=true&super=true"
 
     # Retry loop to handle 502 Bad Gateway and other temporary hiccups
@@ -17,13 +17,24 @@ def get_data():
             print(f"🚀 Fetching PrizePicks data (Attempt {attempt + 1})...")
             response = requests.get(api_url, timeout=60)
             
+            # 1. Handle Bad Gateways (Proxy connection failure)
             if response.status_code == 502:
-                print("⚠️ 502 Bad Gateway: The proxy hit a wall. Retrying in 10s...")
-                time.sleep(10)
+                print("⚠️ 502 Bad Gateway: Connection timed out. Retrying in 15s...")
+                time.sleep(15)
                 continue
             
+            # 2. Handle 403 Forbidden (Blocked IP)
             if response.status_code == 403:
-                print("❌ 403 Forbidden: Even the residential proxy was flagged. Try again later.")
+                print("❌ 403 Forbidden: Cloudflare blocked this IP. Trying again in 15s...")
+                time.sleep(15)
+                continue
+
+            # 3. SAFETY CHECK: Verify JSON Content-Type
+            # This prevents 'JSONDecodeError' when receiving an HTML block page.
+            content_type = response.headers.get('Content-Type', '')
+            if 'application/json' not in content_type:
+                print(f"❌ Error: Expected JSON but received {content_type}.")
+                print(f"Raw Snippet (to debug): {response.text[:200]}")
                 return None
                 
             response.raise_for_status()
@@ -32,20 +43,22 @@ def get_data():
             
         except Exception as e:
             print(f"❌ Attempt {attempt + 1} failed: {e}")
-            time.sleep(10)
+            time.sleep(15)
             
-    print("🛑 All 3 attempts failed. Check your Scrape.do dashboard credits.")
+    print("🛑 All attempts failed. Check Scrape.do credits or PrizePicks API status.")
     return None
 
 def build_multiple_slips():
     raw_data = get_data()
-    if not raw_data: return
+    if not raw_data: 
+        print("Stopping script: No valid data to process.")
+        return
 
     player_map = {}
     history_map = {} 
 
     # 1. Map Player Names and Stats
-    # PrizePicks separates player info into the 'included' section
+    # Included section contains player metadata
     for item in raw_data.get('included', []):
         if item['type'] == 'new_player':
             player_map[item['id']] = item['attributes']['name']
@@ -61,7 +74,7 @@ def build_multiple_slips():
         history = history_map.get(p['id'], [])
         
         if len(history) >= 5:
-            # Check how many times they went OVER the line in the last 5
+            # Check how many times they went OVER the line in the last 5 games
             hits = sum(1 for score in history if float(score) > line)
             if hits >= 4:
                 rel = p.get('relationships', {})
@@ -77,6 +90,8 @@ def build_multiple_slips():
     if not valid_plays:
         print("No 80%+ hit rate plays found right now.")
         return
+
+    print(f"✅ Found {len(valid_plays)} valid plays. Sending to Discord...")
 
     # 3. Send to Discord in chunks (Discord limit is 25 fields per embed)
     for i in range(0, len(valid_plays), 25):
