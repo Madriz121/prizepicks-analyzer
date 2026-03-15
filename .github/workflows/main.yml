@@ -17,20 +17,18 @@ jobs:
         with:
           python-version: '3.10'
 
-      - name: Install Google Chrome
-        run: |
-          sudo apt-get update
-          sudo apt-get install -y google-chrome-stable
+      - name: Setup Chrome
+        uses: browser-actions/setup-chrome@v1
+        with:
+          chrome-version: stable
+          install-chromedriver: true
 
       - name: Install Dependencies
         run: |
           python -m pip install --upgrade pip
-          # Added selenium and undetected-chromedriver to match the new script
           pip install selenium undetected-chromedriver discord-webhook requests
 
       - name: Run Script
         env:
           DISCORD_WEBHOOK: ${{ secrets.DISCORD_WEBHOOK }}
-          PROXY_URL: ${{ secrets.PROXY_URL }}
-          SCRAPE_DO_TOKEN: ${{ secrets.SCRAPE_DO_TOKEN }}
         run: python main.py
