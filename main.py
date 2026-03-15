@@ -1,125 +1,101 @@
-import os
 import time
-import requests
+import json
+import os
+from selenium import webdriver
+from selenium.webdriver.chrome.options import Options
+import undetected_chromedriver as uc
 from discord_webhook import DiscordWebhook, DiscordEmbed
 
-def get_data():
-    token = os.getenv("SCRAPE_DO_TOKEN")
-    target_url = "https://api.prizepicks.com/projections?league_id=7"
-    
-    # Logic: super=true (Residential IP) + render=true (Solves Cloudflare)
-    # These parameters ensure the highest success rate against PrizePicks security.
-    api_url = f"https://api.scrape.do?token={token}&url={target_url}&render=true&super=true"
-
-    # Retry loop to handle 502 Bad Gateway and other temporary hiccups
-    for attempt in range(3):
-        try:
-            print(f"🚀 Fetching PrizePicks data (Attempt {attempt + 1})...")
-            response = requests.get(api_url, timeout=60)
-            
-            # 1. Handle Bad Gateways (Proxy connection failure)
-            if response.status_code == 502:
-                print("⚠️ 502 Bad Gateway: Connection timed out. Retrying in 15s...")
-                time.sleep(15)
-                continue
-            
-            # 2. Handle 403 Forbidden (Blocked IP)
-            if response.status_code == 403:
-                print("❌ 403 Forbidden: Cloudflare blocked this IP. Trying again in 15s...")
-                time.sleep(15)
-                continue
-
-            # 3. SAFETY CHECK: Verify JSON Content-Type
-            # This prevents 'JSONDecodeError' when receiving an HTML block page.
-            content_type = response.headers.get('Content-Type', '')
-            if 'application/json' not in content_type:
-                print(f"❌ Error: Expected JSON but received {content_type}.")
-                print(f"Raw Snippet (to debug): {response.text[:200]}")
-                return None
-                
-            response.raise_for_status()
-            print("✅ Data successfully retrieved!")
-            return response.json()
-            
-        except Exception as e:
-            print(f"❌ Attempt {attempt + 1} failed: {e}")
-            time.sleep(15)
-            
-    print("🛑 All attempts failed. Check Scrape.do credits or PrizePicks API status.")
-    return None
-
-def build_multiple_slips():
-    raw_data = get_data()
-    if not raw_data: 
-        print("Stopping script: No valid data to process.")
-        return
-
-    player_map = {}
-    history_map = {} 
-
-    # 1. Map Player Names and Stats
-    # Included section contains player metadata
-    for item in raw_data.get('included', []):
-        if item['type'] == 'new_player':
-            player_map[item['id']] = item['attributes']['name']
-        if item['type'] == 'projection_line':
-            history_map[item['id']] = item['attributes'].get('last_5_performance', [])
-
-    # 2. Extract NBA Plays with 80% (4/5) Filter
-    valid_plays = []
-    for p in raw_data.get('data', []):
-        attr = p['attributes']
-        line = float(attr['line_score'])
-        stat = attr['stat_type']
-        history = history_map.get(p['id'], [])
+class PrizePicksScraper:
+    def __init__(self):
+        self.url = "https://api.prizepicks.com/projections?league_id=7" # NBA
+        self.webhook_url = os.getenv("DISCORD_WEBHOOK")
         
-        if len(history) >= 5:
-            # Check how many times they went OVER the line in the last 5 games
-            hits = sum(1 for score in history if float(score) > line)
-            if hits >= 4:
-                rel = p.get('relationships', {})
-                player_id = rel.get('new_player', {}).get('data', {}).get('id')
-                name = player_map.get(player_id, "Unknown Player")
-                valid_plays.append({
-                    "name": name, 
-                    "stat": stat, 
-                    "line": line, 
-                    "history": f"{hits}/5 L5"
-                })
+    def get_driver(self):
+        options = uc.ChromeOptions()
+        options.add_argument("--headless") # Run in background
+        driver = uc.Chrome(options=options)
+        return driver
 
-    if not valid_plays:
-        print("No 80%+ hit rate plays found right now.")
-        return
+    def fetch_data(self):
+        driver = self.get_driver()
+        print("🌐 Opening PrizePicks...")
+        try:
+            driver.get(self.url)
+            time.sleep(5) # Allow Cloudflare to resolve
+            
+            # Extracting the raw JSON from the pre-tag the browser renders
+            raw_content = driver.find_element("tag name", "body").text
+            data = json.loads(raw_content)
+            return data
+        except Exception as e:
+            print(f"❌ Extraction failed: {e}")
+            return None
+        finally:
+            driver.quit()
 
-    print(f"✅ Found {len(valid_plays)} valid plays. Sending to Discord...")
+    def parse_projections(self, data):
+        if not data: return []
+        
+        # Build maps for easy lookup
+        players = {i['id']: i['attributes']['name'] for i in data['included'] if i['type'] == 'new_player'}
+        stats = {i['id']: i['attributes']['display_name'] for i in data['included'] if i['type'] == 'stat_type'}
+        
+        refined_list = []
+        
+        for item in data['data']:
+            attr = item['attributes']
+            rel = item['relationships']
+            
+            player_id = rel['new_player']['data']['id']
+            stat_type_id = rel['stat_type']['data']['id']
+            
+            # New Logic: Identifying "Discounted" or "Promotional" lines
+            is_promo = attr.get('is_promo', False)
+            
+            refined_list.append({
+                "player": players.get(player_id),
+                "stat": stats.get(stat_type_id),
+                "line": attr['line_score'],
+                "is_promo": is_promo,
+                "description": attr.get('description', 'NBA')
+            })
+            
+        return refined_list
 
-    # 3. Send to Discord in chunks (Discord limit is 25 fields per embed)
-    for i in range(0, len(valid_plays), 25):
-        send_to_discord(valid_plays[i : i + 25], (i // 25) + 1)
+    def find_best_slips(self, plays):
+        # STRATEGY: Prioritize Promos and High-Value Stat Categories
+        # In a real-world scenario, you would compare 'plays' against an Odds API here.
+        recommended = [p for p in plays if p['is_promo']]
+        
+        # Logic: If no promos, grab high-volume stats (Points)
+        if len(recommended) < 3:
+            pts_plays = [p for p in plays if p['stat'] == 'Points'][:5]
+            recommended.extend(pts_plays)
+            
+        return recommended
 
-def send_to_discord(plays, part_num):
-    webhook_url = os.getenv("DISCORD_WEBHOOK")
-    if not webhook_url or not webhook_url.startswith("https"):
-        print("❌ Error: DISCORD_WEBHOOK is missing or invalid.")
-        return
-
-    try:
-        webhook = DiscordWebhook(url=webhook_url)
-        embed = DiscordEmbed(
-            title=f"📋 NBA 80% Hit Rate (Part {part_num})", 
-            color="00ff00"
-        )
-        for p in plays:
+    def send_to_discord(self, slips):
+        if not self.webhook_url: return
+        
+        webhook = DiscordWebhook(url=self.webhook_url)
+        embed = DiscordEmbed(title="🔥 NEW PRIZEPICKS SLIP SEED", color="FF4500")
+        
+        for s in slips[:10]: # Limit to top 10
+            status = "⭐ PROMO" if s['is_promo'] else "📊 Market"
             embed.add_embed_field(
-                name=f"✅ {p['name']}", 
-                value=f"{p['stat']}: **{p['line']}**\nTrend: **{p['history']}**", 
-                inline=True
+                name=f"{s['player']} ({s['stat']})",
+                value=f"Line: **{s['line']}** | Type: {status}",
+                inline=False
             )
+        
         webhook.add_embed(embed)
         webhook.execute()
-        print(f"🚀 Success: Part {part_num} sent to Discord.")
-    except Exception as e:
-        print(f"❌ Webhook failed: {e}")
+        print("🚀 Slip seeds sent to Discord.")
 
 if __name__ == "__main__":
-    build_multiple_slips()
+    scraper = PrizePicksScraper()
+    raw = scraper.fetch_data()
+    all_plays = scraper.parse_projections(raw)
+    top_picks = scraper.find_best_slips(all_plays)
+    scraper.send_to_discord(top_picks)
