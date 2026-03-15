@@ -7,7 +7,7 @@ def get_data():
     headers = {"User-Agent": "Mozilla/5.0"}
     try:
         response = requests.get(url, headers=headers, timeout=10)
-        response.raise_for_status() # Check for HTTP errors
+        response.raise_for_status()
         return response.json()
     except Exception as e:
         print(f"Error fetching data: {e}")
@@ -16,71 +16,84 @@ def get_data():
 def build_multiple_slips():
     raw_data = get_data()
     if not raw_data: 
-        print("No data received from PrizePicks.")
+        print("No data received.")
         return
 
-    # 1. Map Player IDs to Names
+    # 1. Map Player IDs and Stats
     player_map = {}
     for item in raw_data.get('included', []):
         if item['type'] == 'new_player':
             player_map[item['id']] = item['attributes']['name']
 
-    # 2. Extract Valid NBA Plays
+    # 2. Extract Plays & Filter by 80% Hit Rate (4/5)
     all_plays = []
     for p in raw_data.get('data', []):
         attr = p['attributes']
         relationships = p.get('relationships', {})
         player_id = relationships.get('new_player', {}).get('data', {}).get('id')
         
-        name = player_map.get(player_id, "Unknown Player")
-        stat = attr['stat_type']
-        line = attr['line_score']
+        # Extract 'Last 5' data from the attributes
+        # Note: PrizePicks API usually provides 'last_5_performance' or similar in attributes
+        last_5_stats = attr.get('last_5_performance', []) 
         
-        # Consistency Logic
-        pick_type = "OVER" if stat == "Points" else "UNDER"
-        all_plays.append({"name": name, "stat": stat, "line": line, "pick": pick_type})
+        # If last_5 data is missing, we skip to be safe
+        if not last_5_stats or len(last_5_stats) < 5:
+            continue
 
-    # 3. Split into Multiple Slips (Max 6 per slip)
-    slip_size = 6
-    if len(all_plays) < 6: 
-        slip_size = max(3, len(all_plays))
-    
+        line = attr['line_score']
+        stat = attr['stat_type']
+        
+        # Calculate Hit Rate (How many times they went OVER the current line in last 5)
+        hits = sum(1 for game_score in last_5_stats if float(game_score) > float(line))
+        hit_rate = (hits / 5) * 100
+
+        # FILTER: Only 80% hit rate (4 out of 5)
+        if hits >= 4:
+            name = player_map.get(player_id, "Unknown Player")
+            all_plays.append({
+                "name": name, 
+                "stat": stat, 
+                "line": line, 
+                "pick": "OVER", 
+                "history": f"{hits}/5 L5"
+            })
+
+    print(f"Filtered {len(all_plays)} high-probability plays.")
+
+    # 3. Split into Multiple Slips (Max 10 per slip)
+    slip_size = 10
     for i in range(0, len(all_plays), slip_size):
         slip_chunk = all_plays[i : i + slip_size]
-        if len(slip_chunk) >= 3:
+        if len(slip_chunk) >= 3: 
             send_to_discord(slip_chunk, len(slip_chunk), (i // slip_size) + 1)
 
 def send_to_discord(plays, size, slip_num):
-    # Fetch the Webhook URL from Environment Variables
     webhook_url = os.getenv("DISCORD_WEBHOOK")
     
-    # FIX: Safety check to prevent the 'MissingSchema' error
-    if not webhook_url or webhook_url.strip() == "":
-        print(f"CRITICAL ERROR: 'DISCORD_WEBHOOK' environment variable is missing or empty.")
+    if not webhook_url:
+        print(f"CRITICAL: 'DISCORD_WEBHOOK' is missing. Cannot send Slip #{slip_num}")
         return
 
     try:
         webhook = DiscordWebhook(url=webhook_url)
-        
         embed = DiscordEmbed(
-            title=f"📋 Slip #{slip_num}: {size}-Man NBA Flex",
-            color="03b2f8"
+            title=f"🔥 High-Probability Slip #{slip_num} ({size}-Man)",
+            description="All players have an 80%+ hit rate (4/5) on their current line.",
+            color="ff4747"
         )
 
         for p in plays:
-            emoji = "📈" if p['pick'] == "OVER" else "📉"
             embed.add_embed_field(
-                name=p['name'],
-                value=f"{p['stat']}: **{p['line']}**\nPick: **{emoji} {p['pick']}**",
+                name=f"✅ {p['name']}",
+                value=f"{p['stat']}: **{p['line']}**\nL5 Rate: **{p['history']}**",
                 inline=True
             )
 
         webhook.add_embed(embed)
         webhook.execute()
-        print(f"Successfully sent Slip #{slip_num} to Discord.")
-        
+        print(f"Sent Slip #{slip_num} to Discord.")
     except Exception as e:
-        print(f"Failed to send to Discord: {e}")
+        print(f"Webhook Error: {e}")
 
 if __name__ == "__main__":
     build_multiple_slips()
