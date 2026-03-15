@@ -2,8 +2,8 @@ import os
 import requests
 from discord_webhook import DiscordWebhook, DiscordEmbed
 
-def get_nba_projections():
-    url = "https://api.prizepicks.com/projections?league_id=7" # NBA ID
+def get_data():
+    url = "https://api.prizepicks.com/projections?league_id=7" # NBA
     headers = {"User-Agent": "Mozilla/5.0"}
     try:
         response = requests.get(url, headers=headers, timeout=10)
@@ -11,60 +11,62 @@ def get_nba_projections():
     except:
         return None
 
-def build_slips():
-    data = get_nba_projections()
-    if not data: return
+def build_multiple_slips():
+    raw_data = get_data()
+    if not raw_data: return
 
-    # Parse players and their lines
-    projections = data.get('data', [])
-    valid_plays = []
+    # 1. Map Player IDs to Names
+    # PrizePicks puts names in the 'included' section
+    player_map = {}
+    for item in raw_data.get('included', []):
+        if item['type'] == 'new_player':
+            player_map[item['id']] = item['attributes']['name']
 
-    for p in projections:
+    # 2. Extract Valid NBA Plays
+    all_plays = []
+    for p in raw_data.get('data', []):
         attr = p['attributes']
-        # Consistency Logic: 
-        # For now, we lean 'Over' if it's a 'Points' prop and 'Under' for 'Rebounds' 
-        # (This is a placeholder for your custom logic or secondary API data)
-        pick_type = "OVER" if attr['stat_type'] == "Points" else "UNDER"
+        relationships = p.get('relationships', {})
+        player_id = relationships.get('new_player', {}).get('data', {}).get('id')
         
-        valid_plays.append({
-            "name": attr.get("description", "Unknown Player"),
-            "stat": attr['stat_type'],
-            "line": attr['line_score'],
-            "pick": pick_type
-        })
+        name = player_map.get(player_id, "Unknown Player")
+        stat = attr['stat_type']
+        line = attr['line_score']
+        
+        # Consistency Logic (Example: Under if Rebounds/Assists, Over if Points)
+        pick_type = "OVER" if stat == "Points" else "UNDER"
+        
+        all_plays.append({"name": name, "stat": stat, "line": line, "pick": pick_type})
 
-    # Determine Slip Size (6 -> 5 -> 4 -> 3)
-    count = len(valid_plays)
-    slip_size = 0
-    if count >= 6: slip_size = 6
-    elif count == 5: slip_size = 5
-    elif count == 4: slip_size = 4
-    elif count >= 3: slip_size = 3
+    # 3. Split into Multiple Slips (Max 6 per slip)
+    slip_size = 6
+    if len(all_plays) < 6: slip_size = max(3, len(all_plays)) # Fallback
+    
+    # Create chunks of the chosen size
+    for i in range(0, len(all_plays), slip_size):
+        slip_chunk = all_plays[i : i + slip_size]
+        if len(slip_chunk) >= 3: # Only send if there's enough for at least a 3-man
+            send_to_discord(slip_chunk, len(slip_chunk), (i // slip_size) + 1)
 
-    if slip_size > 0:
-        send_to_discord(valid_plays[:slip_size], slip_size)
-
-def send_to_discord(plays, size):
+def send_to_discord(plays, size, slip_num):
     webhook_url = os.getenv("DISCORD_WEBHOOK")
     webhook = DiscordWebhook(url=webhook_url)
     
     embed = DiscordEmbed(
-        title=f"🔥 New {size}-Man Flex Slip Builder",
-        description="Priority: NBA Consistency Model",
-        color="ffcc00"
+        title=f"📋 Slip #{slip_num}: {size}-Man NBA Flex",
+        color="03b2f8"
     )
 
-    for i, play in enumerate(plays, 1):
-        emoji = "📈" if play['pick'] == "OVER" else "📉"
+    for p in plays:
+        emoji = "📈" if p['pick'] == "OVER" else "📉"
         embed.add_embed_field(
-            name=f"Pick #{i}: {play['name']}",
-            value=f"{play['stat']}: **{play['line']}**\nSelection: **{emoji} {play['pick']}**",
+            name=p['name'],
+            value=f"{p['stat']}: **{p['line']}**\nPick: **{emoji} {p['pick']}**",
             inline=True
         )
 
-    embed.set_footer(text="Automated by PrizePicks-Repo")
     webhook.add_embed(embed)
     webhook.execute()
 
 if __name__ == "__main__":
-    build_slips()
+    build_multiple_slips()
