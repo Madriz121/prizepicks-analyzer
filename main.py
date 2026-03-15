@@ -7,8 +7,16 @@ def get_data():
     proxy_url = os.getenv("PROXY_URL") 
     proxies = {"http": proxy_url, "https": proxy_url} if proxy_url else None
 
+    # Step 1: Optional Proxy Test (Helps Debugging)
+    if proxies:
+        try:
+            requests.get("https://httpbin.org/ip", proxies=proxies, timeout=10)
+            print("✅ Proxy connection verified.")
+        except Exception as e:
+            print(f"⚠️ Proxy Test Failed (Check credentials): {e}")
+
     try:
-        # impersonate="chrome120" + proxies is the strongest bypass possible
+        # Step 2: Fetch PrizePicks Data
         response = requests.get(
             url, 
             impersonate="chrome120", 
@@ -17,18 +25,23 @@ def get_data():
         )
         
         if response.status_code == 403:
-            print("Block Detected: The proxy might be flagged or missing. Check GitHub Secrets.")
+            print("❌ 403 Forbidden: PrizePicks blocked this IP/Proxy.")
+            return None
+        elif response.status_code == 407:
+            print("❌ 407 Proxy Auth Error: Check your Webshare username/password.")
             return None
             
         response.raise_for_status()
         return response.json()
     except Exception as e:
-        print(f"Fetch Error: {e}")
+        print(f"❌ Fetch Error: {e}")
         return None
 
 def build_multiple_slips():
     raw_data = get_data()
-    if not raw_data: return
+    if not raw_data: 
+        print("No data retrieved. Exiting.")
+        return
 
     player_map = {}
     history_map = {} 
@@ -55,7 +68,18 @@ def build_multiple_slips():
                 rel = p.get('relationships', {})
                 player_id = rel.get('new_player', {}).get('data', {}).get('id')
                 name = player_map.get(player_id, "Unknown Player")
-                valid_plays.append({"name": name, "stat": stat, "line": line, "history": f"{hits}/5 L5"})
+                valid_plays.append({
+                    "name": name, 
+                    "stat": stat, 
+                    "line": line, 
+                    "history": f"{hits}/5 L5"
+                })
+
+    if not valid_plays:
+        print("Found 0 plays matching the 80% criteria.")
+        return
+
+    print(f"Found {len(valid_plays)} plays. Sending to Discord...")
 
     # 3. Dynamic Chunking (Discord 25-field limit)
     field_limit = 25 
@@ -65,13 +89,31 @@ def build_multiple_slips():
 
 def send_to_discord(plays, part_num):
     webhook_url = os.getenv("DISCORD_WEBHOOK")
-    if not webhook_url: return
-    webhook = DiscordWebhook(url=webhook_url)
-    embed = DiscordEmbed(title=f"📋 NBA 80% Hit Rate (Part {part_num})", color="00ff00")
-    for p in plays:
-        embed.add_embed_field(name=f"✅ {p['name']}", value=f"{p['stat']}: **{p['line']}**\nL5: **{p['history']}**", inline=True)
-    webhook.add_embed(embed)
-    webhook.execute()
+    
+    # NEW FIX: Logic check to prevent 'MissingSchema' error
+    if not webhook_url or not webhook_url.startswith("https"):
+        print(f"❌ ERROR: Invalid DISCORD_WEBHOOK URL. Current value: {webhook_url}")
+        return
+
+    try:
+        webhook = DiscordWebhook(url=webhook_url)
+        embed = DiscordEmbed(
+            title=f"📋 NBA 80% Hit Rate (Part {part_num})", 
+            color="00ff00"
+        )
+        
+        for p in plays:
+            embed.add_embed_field(
+                name=f"✅ {p['name']}", 
+                value=f"{p['stat']}: **{p['line']}**\nTrend: **{p['history']}**", 
+                inline=True
+            )
+            
+        webhook.add_embed(embed)
+        webhook.execute()
+        print(f"🚀 Success: Part {part_num} sent to Discord.")
+    except Exception as e:
+        print(f"❌ Webhook execute failed: {e}")
 
 if __name__ == "__main__":
     build_multiple_slips()
