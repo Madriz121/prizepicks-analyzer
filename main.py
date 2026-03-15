@@ -3,26 +3,42 @@ import requests
 from discord_webhook import DiscordWebhook, DiscordEmbed
 
 def run_prizepicks_check():
-    # 1. Fetch PrizePicks Data
-    url = "https://api.prizepicks.com/projections?league_id=7" # 7 is NBA
-    headers = {"User-Agent": "Mozilla/5.0"}
-    response = requests.get(url, headers=headers)
+    # 1. Get the Webhook from GitHub Secrets
+    webhook_url = os.getenv("DISCORD_WEBHOOK")
     
-    if response.status_code == 200:
-        data = response.json()
-        # For this example, let's just grab the first player's line
-        first_play = data['data'][0]['attributes']
-        player_name = "Player" # You'd parse the 'included' section for names
-        stat_type = first_play['stat_type']
-        line_value = first_play['line_score']
+    if not webhook_url:
+        print("❌ ERROR: DISCORD_WEBHOOK secret is missing or empty!")
+        return
 
-        # 2. Send to Discord
-        webhook_url = os.getenv("DISCORD_WEBHOOK")
-        webhook = DiscordWebhook(url=webhook_url)
-        embed = DiscordEmbed(title="🚀 PrizePicks Opportunity", color="03b2f8")
-        embed.add_embed_field(name="Prop", value=f"{stat_type}: {line_value}")
-        webhook.add_embed(embed)
-        webhook.execute()
+    # 2. Fetch PrizePicks Data
+    url = "https://api.prizepicks.com/projections?league_id=7" # 7 = NBA
+    headers = {"User-Agent": "Mozilla/5.0"}
+    
+    try:
+        response = requests.get(url, headers=headers, timeout=10)
+        response.raise_for_status()
+        data = response.json()
+        
+        # Simple logic to grab the first available prop
+        projection = data['data'][0]['attributes']
+        stat = projection['stat_type']
+        line = projection['line_score']
+        
+        msg_title = "✅ PrizePicks Connection Successful"
+        msg_body = f"Found Live Prop: **{stat} at {line}**"
+        color = "00FF00" # Green
+
+    except Exception as e:
+        msg_title = "⚠️ PrizePicks API Script Status"
+        msg_body = f"Connected to Discord, but couldn't parse PrizePicks: {str(e)}"
+        color = "FFA500" # Orange
+
+    # 3. Execute Webhook
+    webhook = DiscordWebhook(url=webhook_url)
+    embed = DiscordEmbed(title=msg_title, description=msg_body, color=color)
+    webhook.add_embed(embed)
+    webhook.execute()
+    print("🚀 Script finished and attempt sent to Discord.")
 
 if __name__ == "__main__":
     run_prizepicks_check()
