@@ -25,4 +25,5 @@ jobs:
       - name: Run Script
         env:
           DISCORD_WEBHOOK: ${{ secrets.DISCORD_WEBHOOK }}
+          PROXY_URL: ${{ secrets.PROXY_URL }} # Add this line
         run: python main.py
