@@ -3,74 +3,72 @@ import requests
 from discord_webhook import DiscordWebhook, DiscordEmbed
 
 def get_data():
-    # Per_page=250 to catch all the categories in your image
+    # League ID 7 = NBA. per_page=250 ensures we see all prop types (Combos, Turnovers, etc.)
     url = "https://api.prizepicks.com/projections?league_id=7&per_page=250"
     headers = {
-        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
+        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36",
     }
     try:
         response = requests.get(url, headers=headers, timeout=15)
         response.raise_for_status()
         return response.json()
     except Exception as e:
-        print(f"❌ API Error: {e}")
+        print(f"❌ Error fetching PrizePicks: {e}")
         return None
 
-def build_slips():
+def build_consistent_slips():
     raw_data = get_data()
     if not raw_data: return
 
     # 1. Map Player IDs to Names
     player_map = {
-        item.get('id'): item.get('attributes', {}).get('name') 
+        item['id']: item['attributes']['name'] 
         for item in raw_data.get('included', []) 
-        if item.get('type') == 'new_player'
+        if item['type'] == 'new_player'
     }
 
-    # 2. Extract and Filter by 80% Consistency (4/5 Games)
-    high_value_plays = []
-    
-    # These match the fields in your image (Points, Rebs+Asts, Blks+Stls, etc.)
+    # 2. Filter for 80% Consistency (4/5 Games)
+    high_confidence_plays = []
     for p in raw_data.get('data', []):
-        attr = p.get('attributes', {})
+        attr = p['attributes']
         player_id = p.get('relationships', {}).get('new_player', {}).get('data', {}).get('id')
         name = player_map.get(player_id)
         
         stat = attr.get('stat_type')
         line = attr.get('line_score')
-        l5_data = attr.get('last_5_stats')
+        l5_stats = attr.get('last_5_stats') # The key field for consistency
 
-        # DATA VALIDATION
-        if not name or line is None or not l5_data or len(l5_data) < 5:
+        # Skip if missing name, line, or valid L5 data
+        if not name or line is None or not isinstance(l5_stats, list) or len(l5_stats) < 5:
             continue
 
-        # 80% Consistency Check
-        overs = sum(1 for val in l5_data if val is not None and val > line)
-        unders = sum(1 for val in l5_data if val is not None and val < line)
+        # Count how many times they cleared or failed the current line
+        overs = sum(1 for val in l5_stats if val is not None and val > line)
+        unders = sum(1 for val in l5_stats if val is not None and val < line)
 
-        pick_type = None
-        if overs >= 4: pick_type = "OVER"
-        elif unders >= 4: pick_type = "UNDER"
+        pick = None
+        if overs >= 4: pick = "OVER"
+        elif unders >= 4: pick = "UNDER"
 
-        if pick_type:
-            high_value_plays.append({
+        if pick:
+            high_confidence_plays.append({
                 "name": name, "stat": stat, "line": line, 
-                "pick": pick_type, "l5": l5_data
+                "pick": pick, "l5": l5_stats
             })
 
-    # 3. Unique Slip Building (Max 6 man slips)
+    # 3. Build Unique 6-Man Slips
     slip_count = 1
-    remaining = high_value_plays.copy()
+    remaining = high_confidence_plays.copy()
 
     while len(remaining) >= 3:
         current_slip = []
-        used_names = set()
+        players_in_slip = set()
         to_remove = []
 
         for i, play in enumerate(remaining):
-            if len(current_slip) < 6 and play['name'] not in used_names:
+            if len(current_slip) < 6 and play['name'] not in players_in_slip:
                 current_slip.append(play)
-                used_names.add(play['name'])
+                players_in_slip.add(play['name'])
                 to_remove.append(i)
 
         for index in sorted(to_remove, reverse=True):
@@ -83,32 +81,32 @@ def build_slips():
             break
 
 def send_to_discord(plays, size, slip_num):
-    # CRITICAL FIX: Ensure variable is pulled directly from Env
-    url = os.environ.get("DISCORD_WEBHOOK")
+    # This matches the SECRET name in your GitHub settings
+    webhook_url = os.environ.get("DISCORD_WEBHOOK")
     
-    if not url or url == "":
-        print(f"❌ ERROR: Webhook URL is empty! Check GitHub Secrets.")
+    if not webhook_url:
+        print("❌ CRITICAL: Webhook URL is empty. Check GitHub Secrets!")
         return
 
-    webhook = DiscordWebhook(url=url)
+    webhook = DiscordWebhook(url=webhook_url)
     embed = DiscordEmbed(
-        title=f"🔥 80% Consistency Slip #{slip_num}",
-        description=f"**{size}-Man NBA Flex**",
+        title=f"🔥 NBA 80% Consistency Slip #{slip_num}",
+        description=f"**{size}-Man Flex** | Filter: 4/5 Hit Rate",
         color="00ff00"
     )
 
     for p in plays:
         emoji = "📈" if p['pick'] == "OVER" else "📉"
-        l5_history = ", ".join(map(str, p['l5']))
+        l5_str = ", ".join(map(str, p['l5']))
         embed.add_embed_field(
             name=p['name'],
-            value=f"{p['stat']}: **{p['line']}**\nPick: **{emoji} {p['pick']}**\nL5: `{l5_history}`",
+            value=f"{p['stat']}: **{p['line']}**\nPick: **{emoji} {p['pick']}**\nL5: `{l5_str}`",
             inline=True
         )
 
     webhook.add_embed(embed)
     webhook.execute()
-    print(f"✅ Slip #{slip_num} sent to Discord.")
+    print(f"✅ Slip #{slip_num} posted successfully.")
 
 if __name__ == "__main__":
-    build_slips()
+    build_consistent_slips()
