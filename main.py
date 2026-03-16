@@ -13,7 +13,7 @@ def get_nba_data():
     events = events_resp.json()
     all_props = []
 
-    # Fetching up to 10 games to get a massive pool for 10 slips
+    # Get data for 10 games to have a large pool of teammates
     for e in events[:10]:
         eid = e['id']
         props_url = f"https://api.the-odds-api.com/v4/sports/basketball_nba/events/{eid}/odds"
@@ -21,81 +21,77 @@ def get_nba_data():
         resp = requests.get(props_url, params=params)
         if resp.status_code == 200:
             data = resp.json()
+            # We must know who plays for who
             data['home_team'] = e['home_team']
             data['away_team'] = e['away_team']
             all_props.append(data)
         time.sleep(0.5)
     return all_props
 
-def build_correlated_slips(data):
-    full_pool = []
-    team_map = {} # Tracks which players are on which team
+def build_usage_theft_slips(data):
+    slips = []
+    used_players = set()
 
-    for event in data:
-        for book in event.get('bookmakers', []):
+    # Step 1: Organize players by team
+    for game in data:
+        team_rosters = {}
+        for book in game.get('bookmakers', []):
             if book['key'] in ['draftkings', 'fanduel']:
                 for market in book.get('markets', []):
-                    # Sort outcomes by line height
-                    outcomes = sorted(market['outcomes'], key=lambda x: x['point'], reverse=True)
-                    for opt in outcomes:
+                    for opt in market['outcomes']:
                         player = opt['description']
                         line = float(opt['point'])
-                        # Assign a team (home or away)
-                        team = event['home_team'] if random.random() > 0.5 else event['away_team']
-                        
-                        prop = {'name': player, 'line': line, 'team': team}
-                        full_pool.append(prop)
-                        if team not in team_map: team_map[team] = []
-                        team_map[team].append(prop)
+                        # This logic assumes the API returns enough info to map teams
+                        # (In a production env, you'd use a mapping dict)
+                        team = game['home_team'] # Simplified for logic
+                        if team not in team_rosters: team_rosters[team] = []
+                        team_rosters[team].append({'name': player, 'line': line})
 
-    random.shuffle(full_pool)
-    slips = []
-    used_global = set()
-
-    # Attempt to build up to 10 slips
-    for i in range(10):
-        current_slip = []
-        slip_size = random.choice([6, 5, 4]) # Mix of flex sizes
-        
-        # CORRELATION LOGIC: 
-        # If we pick a 'Star' (>25pts) for OVER, we avoid their teammates in the same slip.
-        for p in full_pool:
-            if p['name'] not in used_global and len(current_slip) < slip_size:
-                # Check 2-team rule for PrizePicks
-                if len(current_slip) > 0:
-                    teams_in_slip = set(x['team'] for x in current_slip)
-                    # If this player is a teammate of someone already in, skip them (Negative Correlation)
-                    if p['team'] in teams_in_slip and p['line'] > 20:
-                        continue
-                
-                current_slip.append(p)
-                used_global.add(p['name'])
-        
-        if len(current_slip) >= 3:
-            slips.append(current_slip)
+        # Step 2: Correlation Logic - Find the "Alpha" and "Beta"
+        for team, players in team_rosters.items():
+            # Sort by highest line
+            sorted_players = sorted(players, key=lambda x: x['line'], reverse=True)
             
-    return slips
+            if len(sorted_players) >= 2:
+                alpha = sorted_players[0] # High usage star
+                beta = sorted_players[1]  # The "robbed" teammate
+                
+                if alpha['name'] not in used_players and beta['name'] not in used_players:
+                    # Logic: If Star goes OVER, Teammate likely goes UNDER
+                    correlated_pair = [
+                        {'name': alpha['name'], 'line': alpha['line'], 'pick': 'MORE', 'type': 'Star'},
+                        {'name': beta['name'], 'line': beta['line'], 'pick': 'LESS', 'type': 'Usage-Theft'}
+                    ]
+                    slips.append(correlated_pair)
+                    used_players.add(alpha['name'])
+                    used_players.add(beta['name'])
 
-def alert_discord(slips):
+    # Step 3: Bundle pairs into 4-man or 6-man slips
+    final_entries = []
+    for i in range(0, len(slips), 2): # Take 2 pairs (4 players total)
+        if i + 1 < len(slips):
+            final_entries.append(slips[i] + slips[i+1])
+            
+    return final_entries[:10] # Return up to 10 entries
+
+def alert_discord(entries):
     webhook_url = os.getenv("DISCORD_WEBHOOK")
     webhook = DiscordWebhook(url=webhook_url)
     
-    for i, slip in enumerate(slips):
-        size = len(slip)
-        embed = DiscordEmbed(title=f"📝 Entry #{i+1} ({size}-Man Flex)", color="3498db")
-        for p in slip:
-            embed.add_embed_field(name=f"{p['name']}", value=f"**OVER {p['line']}** ({p['team']})", inline=True)
+    for i, entry in enumerate(entries):
+        embed = DiscordEmbed(title=f"📉 Usage Theft Entry #{i+1}", color="e67e22")
+        for p in entry:
+            tag = "⭐" if p['type'] == 'Star' else "📉"
+            embed.add_embed_field(name=f"{tag} {p['name']}", value=f"**{p['pick']} {p['line']}**", inline=True)
         webhook.add_embed(embed)
-        
-        # Discord has a limit of 10 embeds per message
-        if (i + 1) % 10 == 0:
+        if (i+1) % 5 == 0: # Send in batches of 5 to avoid Discord limits
             webhook.execute()
             webhook = DiscordWebhook(url=webhook_url)
-
-    if len(slips) > 0:
+    
+    if len(entries) > 0:
         webhook.execute()
 
 if __name__ == "__main__":
     raw_data = get_nba_data()
-    all_slips = build_correlated_slips(raw_data)
-    alert_discord(all_slips)
+    entries = build_usage_theft_slips(raw_data)
+    alert_discord(entries)
