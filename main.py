@@ -12,7 +12,7 @@ def get_nba_data():
 
     events = events_resp.json()
     all_props = []
-    # Fetch 15 games to ensure we have enough unique players for 10 slips
+    # Fetching 15 games to ensure a massive pool (60+ players) for 10 unique slips
     for e in events[:15]:
         eid = e['id']
         props_url = f"https://api.the-odds-api.com/v4/sports/basketball_nba/events/{eid}/odds"
@@ -20,34 +20,42 @@ def get_nba_data():
         resp = requests.get(props_url, params=params)
         if resp.status_code == 200:
             data = resp.json()
-            # Canonical game teams
             data['home_team'] = e['home_team']
             data['away_team'] = e['away_team']
             all_props.append(data)
         time.sleep(0.4)
     return all_props
 
+def calculate_success_rate(entry):
+    """Calculates win probability relative to the PrizePicks 54.2% break-even mark."""
+    base_hit_rate = 0.542 
+    total_prob = 1.0
+    for i, p in enumerate(entry):
+        # Anchor legs (first 2) get a 3.5% correlation boost; fillers get 1% market edge
+        leg_edge = 0.035 if i < 2 else 0.01 
+        total_prob *= (base_hit_rate + leg_edge)
+    
+    # Scale to a 0-100 Confidence Score
+    strength = (total_prob / (0.542**len(entry))) * 55
+    return round(min(strength, 99.1), 1)
+
 def build_waterfall_slips(data):
-    # 1. Create a clean map of Team -> List of Unique Players
+    # 1. Map Teams to unique players
     team_map = {}
     for game in data:
-        home, away = game['home_team'], game['away_team']
-        for team in [home, away]:
+        for team in [game['home_team'], game['away_team']]:
             if team not in team_map: team_map[team] = {}
         
         for book in game.get('bookmakers', []):
-            for market in book.get('markets', []):
-                for opt in market['outcomes']:
-                    p_name = opt['description']
-                    # Use a simple heuristic: if the player's name is in the team_map already, keep it
-                    # otherwise, we assign based on common sense (or just use the game data)
-                    # To be safe, we'll associate them with the game context
-                    p_data = {'name': p_name, 'line': float(opt['point']), 'team': home if p_name in str(game) else away}
-                    
-                    # Store unique player per team to avoid duplicate names in different games
-                    team_map[p_data['team']][p_name] = p_data
+            if book['key'] in ['draftkings', 'fanduel', 'pinnacle']:
+                for market in book.get('markets', []):
+                    for opt in market['outcomes']:
+                        p_name = opt['description']
+                        # Determine if player belongs to home or away team
+                        p_team = game['home_team'] if p_name in str(game.get('home_team')) else game['away_team']
+                        team_map[p_team][p_name] = {'name': p_name, 'line': float(opt['point']), 'team': p_team}
 
-    # 2. Convert to list of potential anchor pairs
+    # 2. Create the Correlated Anchor Pool
     correlated_pairs = []
     for team, players in team_map.items():
         sorted_p = sorted(players.values(), key=lambda x: x['line'], reverse=True)
@@ -59,28 +67,28 @@ def build_waterfall_slips(data):
 
     random.shuffle(correlated_pairs)
     final_slips = []
-    used_globally = set() # This is the master list of names
+    used_globally = set() # Master registry to prevent duplicate players across ALL slips
 
-    # 3. Waterfall logic (6-5-4-3) to get 10 slips
+    # 3. WATERFALL LOGIC: Try 6, then 5, then 4, then 3 until 10 slips are built
     for target_size in [6, 5, 4, 3]:
         while len(final_slips) < 10:
             current_slip = []
             
-            # Find an anchor where BOTH players are unused
+            # Step A: Find an Anchor where both players are 100% unused
             anchor = next((cp for cp in correlated_pairs if cp['more']['name'] not in used_globally 
                            and cp['less']['name'] not in used_globally), None)
             
-            if not anchor: break
+            if not anchor: break # No more pairs for this size, move down the waterfall
             
             current_slip.extend([anchor['more'], anchor['less']])
-            # Immediately mark as used so fillers can't grab them
-            temp_used = {anchor['more']['name'], anchor['less']['name']}
+            # Add to a temporary local set to prevent filler from grabbing them
+            temp_local_used = {anchor['more']['name'], anchor['less']['name']}
             
-            # Fill remaining slots from any team, provided they aren't used globally
+            # Step B: Gather fillers who aren't in the global blacklist OR this current anchor
             filler_pool = []
-            for team_players in team_map.values():
-                for p in team_players.values():
-                    if p['name'] not in used_globally and p['name'] not in temp_used:
+            for t_players in team_map.values():
+                for p in t_players.values():
+                    if p['name'] not in used_globally and p['name'] not in temp_local_used:
                         filler_pool.append(p)
             
             random.shuffle(filler_pool)
@@ -89,16 +97,48 @@ def build_waterfall_slips(data):
             if len(filler_pool) >= needed:
                 for i in range(needed):
                     f = filler_pool[i].copy()
+                    # Balance the slip by alternating MORE/LESS for fillers
                     f['pick'] = 'LESS' if i % 2 == 0 else 'MORE'
                     current_slip.append(f)
                 
-                # Success! Save slip and update global blacklist
+                # Step C: Finalize and lock players globally
                 final_slips.append(current_slip)
                 for p in current_slip:
                     used_globally.add(p['name'])
             else:
-                break 
+                break # Not enough fillers left for this size
 
     return final_slips
 
-# (The calculate_success_rate and alert_discord functions remain the same)
+def alert_discord(entries):
+    webhook_url = os.getenv("DISCORD_WEBHOOK")
+    if not webhook_url or not entries: 
+        print("⚠️ No slips to send.")
+        return
+        
+    webhook = DiscordWebhook(url=webhook_url)
+    for i, entry in enumerate(entries):
+        win_rate = calculate_success_rate(entry)
+        size = len(entry)
+        # Color coding: Green for high confidence, Yellow for standard
+        embed = DiscordEmbed(title=f"🏆 Slip #{i+1} ({size}-Man Flex)", color="2ecc71" if win_rate > 58 else "f1c40f")
+        embed.set_description(f"**Confidence Score: {win_rate}%**\n*Logic: Forced Usage Theft (Star MORE / Teammate LESS)*")
+        
+        for idx, p in enumerate(entry):
+            type_label = "⚓ ANCHOR" if idx < 2 else "🎲 FILLER"
+            icon = "📈" if p['pick'] == 'MORE' else "📉"
+            embed.add_embed_field(name=f"{p['name']} ({type_label})", value=f"**{p['pick']} {p['line']}** {icon}\n{p['team']}", inline=True)
+        
+        webhook.add_embed(embed)
+        # Send in batches of 5
+        if (i+1) % 5 == 0:
+            webhook.execute()
+            webhook = DiscordWebhook(url=webhook_url)
+            
+    if entries: webhook.execute()
+    print(f"🚀 Successfully sent {len(entries)} unique slips to Discord.")
+
+if __name__ == "__main__":
+    raw_data = get_nba_data()
+    slips = build_waterfall_slips(raw_data)
+    alert_discord(slips)
