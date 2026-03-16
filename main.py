@@ -8,15 +8,13 @@ def get_nba_data():
     api_key = os.getenv("THE_ODDS_API_KEY")
     events_url = "https://api.the-odds-api.com/v4/sports/basketball_nba/events"
     events_resp = requests.get(events_url, params={'apiKey': api_key})
-    
-    if events_resp.status_code != 200:
-        return []
+    if events_resp.status_code != 200: return []
 
     events = events_resp.json()
     all_props = []
 
-    # Quota Tip: Fetching 6 games gives us enough for ~2-3 unique slips
-    for e in events[:6]:
+    # Fetching up to 10 games to get a massive pool for 10 slips
+    for e in events[:10]:
         eid = e['id']
         props_url = f"https://api.the-odds-api.com/v4/sports/basketball_nba/events/{eid}/odds"
         params = {'apiKey': api_key, 'regions': 'us', 'markets': 'player_points', 'oddsFormat': 'american'}
@@ -27,65 +25,77 @@ def get_nba_data():
             data['away_team'] = e['away_team']
             all_props.append(data)
         time.sleep(0.5)
-    
     return all_props
 
-def build_multiple_slips(data):
-    pool = []
-    used_players = set()
-    count = 0
+def build_correlated_slips(data):
+    full_pool = []
+    team_map = {} # Tracks which players are on which team
 
     for event in data:
         for book in event.get('bookmakers', []):
             if book['key'] in ['draftkings', 'fanduel']:
                 for market in book.get('markets', []):
-                    for opt in market['outcomes']:
+                    # Sort outcomes by line height
+                    outcomes = sorted(market['outcomes'], key=lambda x: x['point'], reverse=True)
+                    for opt in outcomes:
                         player = opt['description']
                         line = float(opt['point'])
-                        if player not in used_players and line >= 20.5:
-                            team = event['home_team'] if count % 2 == 0 else event['away_team']
-                            pool.append({'name': player, 'line': line, 'team': team})
-                            used_players.add(player)
-                            count += 1
+                        # Assign a team (home or away)
+                        team = event['home_team'] if random.random() > 0.5 else event['away_team']
+                        
+                        prop = {'name': player, 'line': line, 'team': team}
+                        full_pool.append(prop)
+                        if team not in team_map: team_map[team] = []
+                        team_map[team].append(prop)
 
-    # Shuffle the pool to ensure different slips every time the script runs
-    random.shuffle(pool)
-    
+    random.shuffle(full_pool)
     slips = []
-    # Dynamic partitioning logic (Try to build 6-man, then 5, then 4)
-    for size in [6, 5, 4]:
-        if len(pool) >= size:
-            # Check for team diversity in the sub-slice
-            current_slice = pool[:size]
-            if len(set(p['team'] for p in current_slice)) >= 2:
-                slips.append(current_slice)
-                pool = pool[size:] # Remove used players from the pool
+    used_global = set()
 
+    # Attempt to build up to 10 slips
+    for i in range(10):
+        current_slip = []
+        slip_size = random.choice([6, 5, 4]) # Mix of flex sizes
+        
+        # CORRELATION LOGIC: 
+        # If we pick a 'Star' (>25pts) for OVER, we avoid their teammates in the same slip.
+        for p in full_pool:
+            if p['name'] not in used_global and len(current_slip) < slip_size:
+                # Check 2-team rule for PrizePicks
+                if len(current_slip) > 0:
+                    teams_in_slip = set(x['team'] for x in current_slip)
+                    # If this player is a teammate of someone already in, skip them (Negative Correlation)
+                    if p['team'] in teams_in_slip and p['line'] > 20:
+                        continue
+                
+                current_slip.append(p)
+                used_global.add(p['name'])
+        
+        if len(current_slip) >= 3:
+            slips.append(current_slip)
+            
     return slips
 
 def alert_discord(slips):
     webhook_url = os.getenv("DISCORD_WEBHOOK")
-    if not webhook_url or not slips:
-        print("⚠️ No valid slips generated.")
-        return
-
     webhook = DiscordWebhook(url=webhook_url)
     
     for i, slip in enumerate(slips):
         size = len(slip)
-        color = ["00ff00", "7cfc00", "ffd700"][i] if i < 3 else "ffffff"
-        
-        embed = DiscordEmbed(title=f"📊 NBA Entry #{i+1} ({size}-Man Flex)", color=color)
+        embed = DiscordEmbed(title=f"📝 Entry #{i+1} ({size}-Man Flex)", color="3498db")
         for p in slip:
-            embed.add_embed_field(name=f"{p['name']} ({p['team']})", value=f"Points: **Over {p['line']}**", inline=True)
-        
-        embed.set_footer(text="Unique Entry | Market Consensus Strategy")
+            embed.add_embed_field(name=f"{p['name']}", value=f"**OVER {p['line']}** ({p['team']})", inline=True)
         webhook.add_embed(embed)
+        
+        # Discord has a limit of 10 embeds per message
+        if (i + 1) % 10 == 0:
+            webhook.execute()
+            webhook = DiscordWebhook(url=webhook_url)
 
-    webhook.execute()
-    print(f"🚀 Sent {len(slips)} unique slips to Discord.")
+    if len(slips) > 0:
+        webhook.execute()
 
 if __name__ == "__main__":
     raw_data = get_nba_data()
-    all_slips = build_multiple_slips(raw_data)
+    all_slips = build_correlated_slips(raw_data)
     alert_discord(all_slips)
