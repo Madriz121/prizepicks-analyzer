@@ -13,7 +13,7 @@ def get_nba_data():
     events = events_resp.json()
     all_props = []
 
-    # Fetching up to 10 games to ensure enough players for ten 6-man slips
+    # Fetching up to 10 games to ensure a massive pool of unique players
     for e in events[:10]:
         eid = e['id']
         props_url = f"https://api.the-odds-api.com/v4/sports/basketball_nba/events/{eid}/odds"
@@ -28,9 +28,9 @@ def get_nba_data():
     return all_props
 
 def build_usage_slips(data):
+    # Step 1: Flatten all unique teammate pairs from the slate
     pair_pool = []
     for game in data:
-        # Organize by team to find Alpha/Beta pairs
         for team_key in ['home_team', 'away_team']:
             team_name = game[team_key]
             players = []
@@ -40,7 +40,7 @@ def build_usage_slips(data):
                         for opt in market['outcomes']:
                             players.append({'name': opt['description'], 'line': float(opt['point']), 'team': team_name})
             
-            # Create Over/Under pairs for each team
+            # Sort by highest line to find the Alpha/Beta usage correlation
             sorted_p = sorted(players, key=lambda x: x['line'], reverse=True)
             if len(sorted_p) >= 2:
                 pair_pool.append([
@@ -50,35 +50,39 @@ def build_usage_slips(data):
 
     random.shuffle(pair_pool)
     final_slips = []
-    used_global_players = set()
+    used_globally = set()
 
-    # Step-down Logic: Prioritize 6-man, then 5, then 4
+    # Step 2: Priority Waterfall (6 -> 5 -> 4)
     for target_size in [6, 5, 4]:
         while True:
             current_entry = []
-            potential_pairs = []
+            used_in_this_slip = set() # Local check to prevent image_e5ebf3.png error
             
-            # Find enough pairs to reach the target size
+            # Identify pairs that haven't been used globally or locally
             for pair in pair_pool:
                 p1, p2 = pair[0], pair[1]
-                if p1['name'] not in used_global_players and p2['name'] not in used_global_players:
-                    # PrizePicks needs at least 2 teams; our pair logic handles this as we add pairs from diff games
-                    potential_pairs.append(pair)
-                    if len(potential_pairs) * 2 >= target_size:
-                        break
-            
-            # If we found enough pairs for this specific target size
-            if len(potential_pairs) * 2 >= target_size:
-                for pair in potential_pairs:
-                    current_entry.extend(pair)
-                    used_global_players.add(pair[0]['name'])
-                    used_global_players.add(pair[1]['name'])
                 
-                # Truncate if we hit 6-man limit (since we add in pairs)
-                final_slips.append(current_entry[:target_size])
+                # STRICT UNIQUE CHECK
+                if p1['name'] not in used_globally and p2['name'] not in used_globally:
+                    if p1['name'] not in used_in_this_slip and p2['name'] not in used_in_this_slip:
+                        current_entry.extend([p1, p2])
+                        used_in_this_slip.add(p1['name'])
+                        used_in_this_slip.add(p2['name'])
+                        
+                        if len(current_entry) >= target_size:
+                            break
+            
+            # If we successfully built a full slip of the target size
+            if len(current_entry) >= target_size:
+                final_entry = current_entry[:target_size]
+                final_slips.append(final_entry)
+                # Lock players globally so they never appear in another slip today
+                for p in final_entry:
+                    used_globally.add(p['name'])
+                
                 if len(final_slips) >= 10: return final_slips
             else:
-                # Move to next smaller slip size (e.g., from 6 to 5)
+                # No more possible slips of this size, move to the next size down
                 break
 
     return final_slips
@@ -90,12 +94,12 @@ def alert_discord(entries):
     webhook = DiscordWebhook(url=webhook_url)
     for i, entry in enumerate(entries):
         size = len(entry)
-        color = "FFD100" if size == 6 else "C0C0C0" # Gold for 6, Silver for others
-        embed = DiscordEmbed(title=f"🚀 Entry #{i+1} ({size}-Man Flex)", color=color)
+        color = "FFD100" if size == 6 else "3498db"
+        embed = DiscordEmbed(title=f"📊 Entry #{i+1} ({size}-Man Flex)", color=color)
         
         for p in entry:
             direction = "MORE 📈" if p['pick'] == "MORE" else "LESS 📉"
-            embed.add_embed_field(name=p['name'], value=f"**{direction} {p['line']}** ({p['team']})", inline=True)
+            embed.add_embed_field(name=p['name'], value=f"**{direction} {p['line']}**\n{p['team']}", inline=True)
         
         webhook.add_embed(embed)
         if (i+1) % 5 == 0:
