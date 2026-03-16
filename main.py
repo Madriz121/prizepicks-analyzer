@@ -13,8 +13,8 @@ def get_nba_data():
     events = events_resp.json()
     all_props = []
 
-    # Get up to 10 games to have a massive pool (60 unique players needed for 10 6-man slips)
-    for e in events[:10]:
+    # Fetch 10+ games. We need 60 unique players for ten 6-man slips.
+    for e in events[:12]:
         eid = e['id']
         props_url = f"https://api.the-odds-api.com/v4/sports/basketball_nba/events/{eid}/odds"
         params = {'apiKey': api_key, 'regions': 'us', 'markets': 'player_points', 'oddsFormat': 'american'}
@@ -27,58 +27,48 @@ def get_nba_data():
         time.sleep(0.5)
     return all_props
 
-def build_unique_slips(data):
-    pair_pool = []
-    # 1. Create the pool of Alpha/Beta pairs
+def build_strict_unique_slips(data):
+    # Flatten everything into a single master pool of players
+    master_pool = []
     for game in data:
-        for team_key in ['home_team', 'away_team']:
-            team_name = game[team_key]
-            players = []
-            for book in game.get('bookmakers', []):
-                if book['key'] in ['draftkings', 'fanduel']:
-                    for market in book.get('markets', []):
-                        for opt in market['outcomes']:
-                            players.append({'name': opt['description'], 'line': float(opt['point']), 'team': team_name})
-            
-            sorted_p = sorted(players, key=lambda x: x['line'], reverse=True)
-            if len(sorted_p) >= 2:
-                pair_pool.append([
-                    {'name': sorted_p[0]['name'], 'line': sorted_p[0]['line'], 'pick': 'MORE', 'team': team_name},
-                    {'name': sorted_p[1]['name'], 'line': sorted_p[1]['line'], 'pick': 'LESS', 'team': team_name}
-                ])
+        for book in game.get('bookmakers', []):
+            if book['key'] in ['draftkings', 'fanduel']:
+                for market in book.get('markets', []):
+                    # Sort players by line to keep correlation info
+                    outcomes = sorted(market['outcomes'], key=lambda x: float(x['point']), reverse=True)
+                    for i, opt in enumerate(outcomes):
+                        master_pool.append({
+                            'name': opt['description'],
+                            'line': float(opt['point']),
+                            'team': game['home_team'] if i % 2 == 0 else game['away_team'],
+                            'rank': i # 0 is Alpha (Star), 1+ are Betas
+                        })
 
-    random.shuffle(pair_pool)
+    random.shuffle(master_pool)
     final_slips = []
-    used_globally = set()
+    # THIS IS THE KEY: Players in this set can NEVER be picked again.
+    blacklisted_players = set()
 
-    # 2. Priority Waterfall (6 -> 5 -> 4)
+    # Step-down priority: 6-man > 5-man > 4-man
     for target_size in [6, 5, 4]:
         while len(final_slips) < 10:
             current_entry = []
-            used_in_this_slip = set() # Local unique check
             
-            # Identify pairs that fit the unique constraints
-            for pair in pair_pool:
-                p1, p2 = pair[0], pair[1]
-                
-                # Check Global AND Local sets
-                if p1['name'] not in used_globally and p2['name'] not in used_globally:
-                    if p1['name'] not in used_in_this_slip and p2['name'] not in used_in_this_slip:
-                        current_entry.extend([p1, p2])
-                        used_in_this_slip.add(p1['name'])
-                        used_in_this_slip.add(p2['name'])
-                        
-                        if len(current_entry) >= target_size:
-                            break
+            # Find unique players for this slip
+            for p in master_pool:
+                if p['name'] not in blacklisted_players:
+                    # Assign MORE/LESS based on usage rank (0 = MORE, others = LESS)
+                    p['pick'] = 'MORE' if p['rank'] == 0 else 'LESS'
+                    current_entry.append(p)
+                    blacklisted_players.add(p['name']) # Immediately blacklist
+                    
+                    if len(current_entry) == target_size:
+                        break
             
-            # If we hit the target size, lock the players and save the slip
-            if len(current_entry) >= target_size:
-                final_entry = current_entry[:target_size]
-                for p in final_entry:
-                    used_globally.add(p['name'])
-                final_slips.append(final_entry)
+            if len(current_entry) == target_size:
+                final_slips.append(current_entry)
             else:
-                # No more possible slips of this size, try next size down
+                # Not enough unique players left for this size, try next size down
                 break
 
     return final_slips
@@ -90,15 +80,17 @@ def alert_discord(entries):
     webhook = DiscordWebhook(url=webhook_url)
     for i, entry in enumerate(entries):
         size = len(entry)
-        color = "FFD100" if size == 6 else "3498db"
-        embed = DiscordEmbed(title=f"🏆 Slip #{i+1} ({size}-Man Flex)", color=color)
+        embed = DiscordEmbed(title=f"💎 Unique Entry #{i+1} ({size}-Man)", color="2ecc71")
         
         for p in entry:
-            emoji = "📈" if p['pick'] == "MORE" else "📉"
-            embed.add_embed_field(name=f"{p['name']} ({p['team']})", value=f"**{p['pick']} {p['line']}** {emoji}", inline=True)
+            emoji = "🔥" if p['pick'] == 'MORE' else "❄️"
+            embed.add_embed_field(
+                name=f"{p['name']}", 
+                value=f"**{p['pick']} {p['line']}** {emoji}\n_{p['team']}_", 
+                inline=True
+            )
         
         webhook.add_embed(embed)
-        # Send in batches of 5 to respect Discord's embed limit per message
         if (i+1) % 5 == 0:
             webhook.execute()
             webhook = DiscordWebhook(url=webhook_url)
@@ -107,5 +99,5 @@ def alert_discord(entries):
 
 if __name__ == "__main__":
     raw_data = get_nba_data()
-    entries = build_unique_slips(raw_data)
+    entries = build_strict_unique_slips(raw_data)
     alert_discord(entries)
