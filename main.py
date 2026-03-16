@@ -1,78 +1,85 @@
 import os
 import requests
+import time
 from discord_webhook import DiscordWebhook, DiscordEmbed
 
-def get_nba_props():
-    API_KEY = os.getenv("THE_ODDS_API_KEY")
-    url = "https://api.the-odds-api.com/v4/sports/basketball_nba/props"
-    params = {
-        'apiKey': API_KEY,
-        'regions': 'us',
-        'markets': 'player_points', 
-        'oddsFormat': 'american'
-    }
-    try:
-        response = requests.get(url, params=params)
-        response.raise_for_status()
-        return response.json()
-    except Exception as e:
-        print(f"❌ API Error: {e}")
+def get_nba_data():
+    api_key = os.getenv("THE_ODDS_API_KEY")
+    # Step 1: Get the list of Event IDs for upcoming NBA games
+    events_url = "https://api.the-odds-api.com/v4/sports/basketball_nba/events"
+    events_resp = requests.get(events_url, params={'apiKey': api_key})
+    
+    if events_resp.status_code != 200:
+        print(f"❌ Failed to fetch events: {events_resp.status_code}")
         return []
 
-def build_parlays(events):
-    # Dictionaries to track player data
+    event_ids = [e['id'] for e in events_resp.json()]
     all_props = []
-    used_players = set()
+
+    # Step 2: Fetch props for the first 3 games (to save API credits)
+    for eid in event_ids[:3]:
+        props_url = f"https://api.the-odds-api.com/v4/sports/basketball_nba/events/{eid}/odds"
+        params = {
+            'apiKey': api_key,
+            'regions': 'us',
+            'markets': 'player_points',
+            'oddsFormat': 'american'
+        }
+        resp = requests.get(props_url, params=params)
+        if resp.status_code == 200:
+            all_props.append(resp.json())
+        time.sleep(1) # Be gentle with the API
     
-    for event in events:
-        for book in event.get('bookmakers', []):
-            market = next((m for m in book.get('markets', []) if m['key'] == 'player_points'), None)
-            if market:
-                for outcome in market.get('outcomes', []):
-                    all_props.append({
-                        'player': outcome['description'],
-                        'line': float(outcome['point']),
-                        'book': book['title']
-                    })
+    return all_props
 
-    # 1. Build Consistency Slip (High Lines where books agree)
-    # Strategy: Find players with lines > 25.5 (Star players with high floors)
+def build_unique_parlays(data):
     consistency_slip = []
-    for p in sorted(all_props, key=lambda x: x['line'], reverse=True):
-        if p['player'] not in used_players and len(consistency_slip) < 3:
-            consistency_slip.append(p)
-            used_players.add(p['player'])
-
-    # 2. Build Volatility Slip (Lower lines that are likely to fluctuate)
-    # Strategy: Players in the 15-20 point range who are "Inconsistent" scorers
     volatility_slip = []
-    for p in sorted(all_props, key=lambda x: x['line']):
-        if p['player'] not in used_players and 14 < p['line'] < 22 and len(volatility_slip) < 3:
-            volatility_slip.append(p)
-            used_players.add(p['player'])
+    used_players = set()
+
+    for event in data:
+        for book in event.get('bookmakers', []):
+            if book['key'] in ['draftkings', 'fanduel']:
+                for market in book.get('markets', []):
+                    # Sort outcomes by line value (high to low)
+                    outcomes = sorted(market['outcomes'], key=lambda x: x['point'], reverse=True)
+                    
+                    for opt in outcomes:
+                        player = opt['description']
+                        line = float(opt['point'])
+                        
+                        if player not in used_players:
+                            # CONSISTENCY: High-tier players (25+ pts)
+                            if line >= 24.5 and len(consistency_slip) < 3:
+                                consistency_slip.append({'name': player, 'line': line, 'type': 'OVER'})
+                                used_players.add(player)
+                            
+                            # VOLATILITY: Mid-tier players (12-18 pts)
+                            elif 11.5 <= line <= 18.5 and len(volatility_slip) < 3:
+                                volatility_slip.append({'name': player, 'line': line, 'type': 'UNDER'})
+                                used_players.add(player)
 
     return consistency_slip, volatility_slip
 
-def send_parlays_to_discord(safe, risky):
+def alert_discord(safe, risky):
     webhook_url = os.getenv("DISCORD_WEBHOOK")
     webhook = DiscordWebhook(url=webhook_url)
 
-    # Embed 1: The Safety Parlay
-    safe_embed = DiscordEmbed(title="🛡️ The Consistency Slip (High Floor)", color="2ecc71")
-    for p in safe:
-        safe_embed.add_embed_field(name=p['player'], value=f"Points: **Over {p['line']}**", inline=True)
-    
-    # Embed 2: The Volatility Parlay
-    risk_embed = DiscordEmbed(title="🎲 The Volatility Slip (High Variance)", color="e74c3c")
-    for p in risky:
-        risk_embed.add_embed_field(name=p['player'], value=f"Points: **Under {p['line']}**", inline=True)
+    if safe:
+        safe_embed = DiscordEmbed(title="🛡️ CONSISTENCY PARLAY (Unique Players)", color="2ecc71")
+        for p in safe:
+            safe_embed.add_embed_field(name=p['name'], value=f"Points: **{p['type']} {p['line']}**")
+        webhook.add_embed(safe_embed)
 
-    webhook.add_embed(safe_embed)
-    webhook.add_embed(risk_embed)
+    if risky:
+        risk_embed = DiscordEmbed(title="🎲 VOLATILITY PARLAY (Unique Players)", color="e74c3c")
+        for p in risky:
+            risk_embed.add_embed_field(name=p['name'], value=f"Points: **{p['type']} {p['line']}**")
+        webhook.add_embed(risk_embed)
+
     webhook.execute()
 
 if __name__ == "__main__":
-    data = get_nba_props()
-    if data:
-        safe_slip, risky_slip = build_parlays(data)
-        send_parlays_to_discord(safe_slip, risky_slip)
+    raw_data = get_nba_data()
+    s1, s2 = build_unique_parlays(raw_data)
+    alert_discord(s1, s2)
