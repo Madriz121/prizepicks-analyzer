@@ -3,150 +3,141 @@ import requests
 import time
 import random
 from discord_webhook import DiscordWebhook, DiscordEmbed
+# New Import for Stats
+from nba_api.stats.endpoints import playergamelog
+from nba_api.stats.static import players
 
 def get_nba_data():
     api_key = os.getenv("THE_ODDS_API_KEY")
-    # Fetching both US and EU (EU gives us Pinnacle, the 'Sharp' benchmark)
     events_url = "https://api.the-odds-api.com/v4/sports/basketball_nba/events"
     events_resp = requests.get(events_url, params={'apiKey': api_key})
     if events_resp.status_code != 200: return []
 
     events = events_resp.json()
     all_props = []
-    for e in events[:12]:
+    for e in events[:10]: # Limited to 10 games to avoid API timeouts
         eid = e['id']
         props_url = f"https://api.the-odds-api.com/v4/sports/basketball_nba/events/{eid}/odds"
-        # We pull regions 'us' and 'eu' to compare PrizePicks/DK against Pinnacle
-        params = {'apiKey': api_key, 'regions': 'us,eu', 'markets': 'player_points', 'oddsFormat': 'american'}
+        params = {'apiKey': api_key, 'regions': 'us', 'markets': 'player_points', 'oddsFormat': 'american'}
         resp = requests.get(props_url, params=params)
         if resp.status_code == 200:
             data = resp.json()
             data['home_team'] = e['home_team']
             data['away_team'] = e['away_team']
             all_props.append(data)
-        time.sleep(0.5)
+        time.sleep(0.6) # Standard rate limiting
     return all_props
 
+def get_last_5_avg(player_name):
+    """Fetches the PPG over the last 5 games using nba_api."""
+    try:
+        search = players.find_players_by_full_name(player_name)
+        if not search: return None
+        p_id = search[0]['id']
+        
+        # Fetch logs (last_n_games_stats is key here)
+        log = playergamelog.PlayerGameLog(player_id=p_id, season='2023-24') # Update season as needed
+        df = log.get_data_frames()[0]
+        
+        if df.empty: return None
+        last_5 = df.head(5)
+        return round(last_5['PTS'].mean(), 1)
+    except Exception as e:
+        print(f"Error fetching stats for {player_name}: {e}")
+        return None
+
 def calculate_success_rate(entry):
-    """Calculates probability based on historical PrizePicks break-even (54.2%)."""
     base_hit_rate = 0.542 
     total_prob = 1.0
     for i, p in enumerate(entry):
-        # Anchors get a 3.5% correlation boost; fillers get a 2% 'Sharp Market' edge
-        leg_edge = 0.035 if i < 2 else 0.02 
-        total_prob *= (base_hit_rate + leg_edge)
+        # Higher edge if the Trend Gap is massive (> 4 points)
+        trend_edge = 0.04 if abs(p.get('trend_diff', 0)) > 4 else 0.02
+        total_prob *= (base_hit_rate + trend_edge)
     
     strength = (total_prob / (0.542**len(entry))) * 55
     return round(min(strength, 99.1), 1)
 
-def build_waterfall_slips(data):
-    team_map = {}
+def build_trend_slips(data):
     player_pool = []
-
+    
+    print("📊 Analyzing Player Trends (Last 5 Games)...")
     for game in data:
-        # Identify the 'Sharp' line from Pinnacle first
-        sharp_lines = {}
         for book in game.get('bookmakers', []):
-            if book['key'] == 'pinnacle':
-                for m in book.get('markets', []):
-                    for opt in m['outcomes']:
-                        sharp_lines[opt['description']] = float(opt['point'])
-
-        # Process players and calculate the "Sharp Gap"
-        for book in game.get('bookmakers', []):
-            if book['key'] in ['draftkings', 'fanduel', 'pinnacle']:
+            # Focus on PrizePicks or DraftKings lines
+            if book['key'] in ['draftkings', 'prizepicks']:
                 for market in book.get('markets', []):
                     for opt in market['outcomes']:
                         p_name = opt['description']
                         line = float(opt['point'])
-                        p_team = game['home_team'] if p_name in str(game.get('home_team')) else game['away_team']
                         
-                        # The Gap: How much our platform differs from the Sharpest Book
-                        sharp_val = sharp_lines.get(p_name, line)
-                        gap = line - sharp_val # Positive means line is too high (LESS), Negative means too low (MORE)
+                        avg_5 = get_last_5_avg(p_name)
+                        if avg_5 is None: continue
                         
-                        p_obj = {'name': p_name, 'line': line, 'team': p_team, 'gap': gap}
+                        diff = avg_5 - line
                         
-                        if p_team not in team_map: team_map[p_team] = {}
-                        team_map[p_team][p_name] = p_obj
-                        player_pool.append(p_obj)
+                        # LOGIC: Difference must be at least 2
+                        if abs(diff) >= 2:
+                            pick = 'MORE' if diff > 0 else 'LESS'
+                            player_pool.append({
+                                'name': p_name,
+                                'line': line,
+                                'avg_5': avg_5,
+                                'trend_diff': round(diff, 1),
+                                'pick': pick,
+                                'team': game['home_team'] if p_name in str(game.get('home_team')) else game['away_team']
+                            })
+                        # Slow down to avoid NBA.com blocking your IP
+                        time.sleep(0.8)
 
-    # 1. Correlated Anchor Pool
-    correlated_pairs = []
-    for team, players in team_map.items():
-        sorted_p = sorted(players.values(), key=lambda x: x['line'], reverse=True)
-        if len(sorted_p) >= 2:
-            correlated_pairs.append({
-                'more': {**sorted_p[0], 'pick': 'MORE'},
-                'less': {**sorted_p[1], 'pick': 'LESS'}
-            })
-
-    random.shuffle(correlated_pairs)
+    # Sort pool by the biggest discrepancies
+    player_pool.sort(key=lambda x: abs(x['trend_diff']), reverse=True)
+    
     final_slips = []
-    used_globally = set()
+    used_players = set()
 
-    # 2. UPDATED WATERFALL: Prioritize 4 and 3 man slips to stop the losing streak
-    for target_size in [4, 3, 5, 6]:
-        while len(final_slips) < 10:
+    # Build 4-man and 3-man slips for safety
+    for target_size in [4, 3]:
+        while len(final_slips) < 5: # Generate up to 5 high-quality slips
             current_slip = []
-            anchor = next((cp for cp in correlated_pairs if cp['more']['name'] not in used_globally 
-                           and cp['less']['name'] not in used_globally), None)
+            for p in player_pool:
+                if p['name'] not in used_players and len(current_slip) < target_size:
+                    current_slip.append(p)
+                    used_players.add(p['name'])
             
-            if not anchor: break
-            
-            current_slip.extend([anchor['more'], anchor['less']])
-            temp_local_used = {anchor['more']['name'], anchor['less']['name']}
-            
-            # 3. FILLER SELECTION: Pick players with the biggest gap vs Pinnacle
-            fillers = [p for p in player_pool if p['name'] not in used_globally and p['name'] not in temp_local_used]
-            # Sort by absolute gap (the bigger the discrepancy, the better the value)
-            fillers.sort(key=lambda x: abs(x['gap']), reverse=True)
-            
-            needed = target_size - len(current_slip)
-            if len(fillers) >= needed:
-                for i in range(needed):
-                    f = fillers[i].copy()
-                    # Logic: If line > Sharp Line, take LESS. If line < Sharp Line, take MORE.
-                    f['pick'] = 'LESS' if f['gap'] > 0 else 'MORE'
-                    current_slip.append(f)
-                
+            if len(current_slip) == target_size:
                 final_slips.append(current_slip)
-                for p in current_slip: used_globally.add(p['name'])
             else:
                 break
+                
     return final_slips
 
 def alert_discord(entries):
     webhook_url = os.getenv("DISCORD_WEBHOOK")
     if not webhook_url or not entries: 
-        print("⚠️ No slips generated or Webhook missing.")
+        print("⚠️ No trend-based slips found.")
         return
         
     webhook = DiscordWebhook(url=webhook_url)
     for i, entry in enumerate(entries):
         win_rate = calculate_success_rate(entry)
-        size = len(entry)
-        color = "2ecc71" if win_rate > 58 else "f1c40f"
+        embed = DiscordEmbed(title=f"📈 Trend Slip #{i+1}", color="3498db")
+        embed.set_description(f"**Confidence: {win_rate}%**\n*Strategy: Last 5 Games Avg vs Line (Min Δ2.0)*")
         
-        embed = DiscordEmbed(title=f"🏆 Slip #{i+1} ({size}-Man)", color=color)
-        embed.set_description(f"**Confidence: {win_rate}%**\n*Strategy: Sharp-Market Gap vs Pinnacle*")
-        
-        for idx, p in enumerate(entry):
-            type_label = "⚓ ANCHOR" if idx < 2 else "📊 SHARP"
-            icon = "📈" if p['pick'] == 'MORE' else "📉"
-            embed.add_embed_field(name=f"{p['name']} ({type_label})", 
-                                  value=f"**{p['pick']} {p['line']}** {icon}\n{p['team']}", 
-                                  inline=True)
+        for p in entry:
+            icon = "🔥" if p['pick'] == 'MORE' else "❄️"
+            embed.add_embed_field(
+                name=f"{p['name']} ({p['team']})", 
+                value=f"**{p['pick']} {p['line']}** {icon}\nL5 Avg: {p['avg_5']} (Δ{p['trend_diff']})", 
+                inline=True
+            )
         
         webhook.add_embed(embed)
-        if (i+1) % 5 == 0:
-            webhook.execute()
-            webhook = DiscordWebhook(url=webhook_url)
-            
-    if entries: webhook.execute()
-    print(f"🚀 Sent {len(entries)} optimized slips to Discord.")
+        webhook.execute()
+        webhook = DiscordWebhook(url=webhook_url)
+    
+    print(f"🚀 Sent {len(entries)} trend-based slips to Discord.")
 
 if __name__ == "__main__":
     raw_data = get_nba_data()
-    slips = build_waterfall_slips(raw_data)
+    slips = build_trend_slips(raw_data)
     alert_discord(slips)
