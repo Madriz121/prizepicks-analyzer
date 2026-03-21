@@ -3,80 +3,69 @@ import requests
 import time
 from discord_webhook import DiscordWebhook, DiscordEmbed
 
-def get_today_lines():
-    """Step 1: Get the current point lines for today's players."""
+def get_live_props():
     api_key = os.getenv("THE_ODDS_API_KEY")
-    # Fetching NBA events for today, March 21, 2026
+    # 1. Get the list of IDs for today's games
     url = "https://api.the-odds-api.com/v4/sports/basketball_nba/events"
     events = requests.get(url, params={'apiKey': api_key}).json()
     
-    if not events:
-        print("No NBA games found in the API for today.")
-        return []
-
-    scout_list = []
-    # Loop through games like Wizards vs Thunder or Pelicans vs Cavaliers
-    for e in events[:5]: 
+    found_players = []
+    # 2. For each game, specifically ask for 'player_points'
+    for e in events[:5]: # Let's check the first 5 games
         eid = e['id']
+        # IMPORTANT: PrizePicks/Underdog are often under the 'us2' or 'us' regions
         prop_url = f"https://api.the-odds-api.com/v4/sports/basketball_nba/events/{eid}/odds"
-        # Specifically requesting the player_points market
-        params = {'apiKey': api_key, 'regions': 'us', 'markets': 'player_points'}
-        p_data = requests.get(prop_url, params=params).json()
+        params = {
+            'apiKey': api_key,
+            'regions': 'us,us2', 
+            'markets': 'player_points',
+            'oddsFormat': 'american'
+        }
         
-        for book in p_data.get('bookmakers', []):
-            if book['key'] in ['draftkings', 'prizepicks']:
+        resp = requests.get(prop_url, params=params).json()
+        
+        # Look specifically for PrizePicks or Underdog in the results
+        for book in resp.get('bookmakers', []):
+            if book['key'] in ['prizepicks', 'underdog', 'draftkings']:
                 for market in book.get('markets', []):
                     for opt in market['outcomes']:
-                        scout_list.append({
+                        found_players.append({
                             'name': opt['description'],
                             'line': float(opt['point']),
-                            'matchup': f"{e['away_team']} @ {e['home_team']}"
+                            'book': book['title']
                         })
-        time.sleep(1) # Respecting API rate limits
-    return scout_list
+        time.sleep(1)
+    return found_players
 
-def get_last_5(player_name):
-    """Step 2: Get the raw points from the last 5 games."""
+def get_stats(name):
+    """Fetches the last 5 games raw scores."""
     headers = {"Authorization": os.getenv("BDL_API_KEY", "")}
     try:
-        # Searching for the player on BallDontLie (GitHub Action safe)
-        p_search = requests.get(f"https://api.balldontlie.io/v1/players?search={player_name}", headers=headers).json()
-        if not p_search.get('data'): return None
-        p_id = p_search['data'][0]['id']
-
-        # Fetching 2025-26 season stats
-        s_url = f"https://api.balldontlie.io/v1/stats?player_ids[]={p_id}&seasons[]=2025&per_page=5"
-        stats = requests.get(s_url, headers=headers).json().get('data', [])
-        return [g['pts'] for g in stats]
+        p = requests.get(f"https://api.balldontlie.io/v1/players?search={name}", headers=headers).json()
+        p_id = p['data'][0]['id']
+        s = requests.get(f"https://api.balldontlie.io/v1/stats?player_ids[]={p_id}&seasons[]=2025&per_page=5", headers=headers).json()
+        return [g['pts'] for g in s.get('data', [])]
     except:
         return None
 
-def run_scout():
-    players = get_today_lines()
+def main():
+    players = get_live_props()
     if not players:
-        print("⚠️ No lines found. Try running again closer to tip-off (after 2PM EST).")
+        print("Still 0? Check if your API plan supports 'us2' region or 'player_props' endpoint.")
         return
 
-    webhook_url = os.getenv("DISCORD_WEBHOOK")
-    webhook = DiscordWebhook(url=webhook_url)
-
-    for p in players[:10]: # Sending the first 10 players found
-        last_5 = get_last_5(p['name'])
+    webhook = DiscordWebhook(url=os.getenv("DISCORD_WEBHOOK"))
+    for p in players[:10]:
+        last_5 = get_stats(p['name'])
         if last_5:
-            embed = DiscordEmbed(title=f"🏀 Scouting: {p['name']}", color="3498DB")
-            embed.add_embed_field(name="Current Line", value=f"**{p['line']} PTS**", inline=True)
-            embed.add_embed_field(name="Last 5 Games", value=f"`{last_5}`", inline=True)
-            embed.set_footer(text=f"Game: {p['matchup']}")
+            embed = DiscordEmbed(title=f"📊 Scouting: {p['name']}", color="E74C3C")
+            embed.add_embed_field(name=f"Current {p['book']} Line", value=f"**{p['line']} PTS**")
+            embed.add_embed_field(name="Last 5 Games", value=f"`{last_5}`")
             webhook.add_embed(embed)
-            
-            # Send in batches to avoid Discord rate limits
             if len(webhook.get_embeds()) >= 3:
                 webhook.execute()
-                webhook = DiscordWebhook(url=webhook_url)
-                time.sleep(2)
-        
-        # Mandatory 12s delay for BallDontLie Free Tier (5 requests/min)
-        time.sleep(12) 
+                webhook = DiscordWebhook(url=os.getenv("DISCORD_WEBHOOK"))
+        time.sleep(12) # Stay under BallDontLie's 5 requests/min limit
 
 if __name__ == "__main__":
-    run_scout()
+    main()
