@@ -3,98 +3,79 @@ import requests
 import time
 from discord_webhook import DiscordWebhook, DiscordEmbed
 
-def get_market_lines():
-    """Fetches today's player point lines from DraftKings/PrizePicks."""
+def get_today_prop_lines():
+    """Fetches today's player point lines (Step 1)."""
     api_key = os.getenv("THE_ODDS_API_KEY")
+    # Get active NBA games for March 21, 2026
     url = "https://api.the-odds-api.com/v4/sports/basketball_nba/events"
-    resp = requests.get(url, params={'apiKey': api_key})
+    events = requests.get(url, params={'apiKey': api_key}).json()
     
-    if resp.status_code != 200: return []
-    
-    events = resp.json()
-    scout_list = []
-    
-    for e in events[:5]: # Scouting first 5 games to save API credits
+    report_data = []
+    # Check lines for the first 5 games (to avoid hitting API limits)
+    for e in events[:5]:
         eid = e['id']
         prop_url = f"https://api.the-odds-api.com/v4/sports/basketball_nba/events/{eid}/odds"
         params = {'apiKey': api_key, 'regions': 'us', 'markets': 'player_points'}
-        p_resp = requests.get(prop_url, params=params)
+        props = requests.get(prop_url, params=params).json()
         
-        if p_resp.status_code == 200:
-            data = p_resp.json()
-            for book in data.get('bookmakers', []):
-                if book['key'] in ['draftkings', 'prizepicks']:
-                    for market in book.get('markets', []):
-                        for opt in market['outcomes']:
-                            scout_list.append({
-                                'name': opt['description'],
-                                'line': float(opt['point']),
-                                'matchup': f"{e['away_team']} @ {e['home_team']}"
-                            })
-        time.sleep(1)
-    return scout_list
+        for book in props.get('bookmakers', []):
+            if book['key'] in ['draftkings', 'prizepicks']:
+                for market in book.get('markets', []):
+                    for opt in market['outcomes']:
+                        report_data.append({
+                            'name': opt['description'],
+                            'line': float(opt['point']),
+                            'matchup': f"{e['away_team']} vs {e['home_team']}"
+                        })
+        time.sleep(1) # Rate limit protection
+    return report_data
 
-def get_player_history(player_name, current_line):
-    """Checks last 5 games against TODAY'S line."""
+def get_last_5_stats(player_name):
+    """Fetches actual points from the last 5 games (Step 2)."""
     headers = {"Authorization": os.getenv("BDL_API_KEY", "")}
     try:
-        # 1. Get Player ID
+        # Search for player to get BDL ID
         p_search = requests.get(f"https://api.balldontlie.io/v1/players?search={player_name}", headers=headers).json()
-        if not p_search['data']: return None
         p_id = p_search['data'][0]['id']
 
-        # 2. Get Last 5 Stats (2025-26 season is '2025')
+        # Get stats for the 2025-26 season
         s_url = f"https://api.balldontlie.io/v1/stats?player_ids[]={p_id}&seasons[]=2025&per_page=5"
-        stats = requests.get(s_url, headers=headers).json().get('data', [])
+        stats_resp = requests.get(s_url, headers=headers).json()
         
-        if not stats: return None
-        pts = [g['pts'] for g in stats]
-        
-        # 3. Calculate 'Hit Rate' vs today's line
-        overs = sum(1 for p in pts if p > current_line)
-        avg_5 = round(sum(pts) / len(pts), 1)
-        
-        return {
-            'pts_log': pts,
-            'avg_5': avg_5,
-            'hit_rate': f"{overs}/5 Over",
-            'is_consistent': overs >= 4 or overs <= 1 # Flag if 80%+ consistent
-        }
+        # Return only the points as a list
+        return [g['pts'] for g in stats_resp.get('data', [])]
     except:
         return None
 
-def run_scout():
-    raw_players = get_market_lines()
-    interesting_plays = []
-
-    print(f"🔎 Scouting {len(raw_players)} lines...")
-    for p in raw_players:
-        history = get_player_history(p['name'], p['line'])
-        if history and history['is_consistent']:
-            p.update(history)
-            interesting_plays.append(p)
-        
-        # Slow down for BallDontLie Free Tier (5 requests/min)
-        time.sleep(12)
-
-    send_to_discord(interesting_plays)
-
-def send_to_discord(reports):
+def run_report():
+    print("📋 Generating Scouting Report for March 21, 2026...")
+    players = get_today_prop_lines()
     webhook_url = os.getenv("DISCORD_WEBHOOK")
-    if not webhook_url or not reports: return
-    
     webhook = DiscordWebhook(url=webhook_url)
-    embed = DiscordEmbed(title="📊 Player Prop Consistency Report", color="2ECC71")
-    
-    for r in reports[:10]: # Top 10 most consistent players
-        embed.add_embed_field(
-            name=f"{r['name']} - Line: {r['line']}",
-            value=f"**Today's Matchup:** {r['matchup']}\n**Hit Rate:** {r['hit_rate']}\n**Last 5 Scores:** {r['pts_log']}\n**L5 Average:** {r['avg_5']}",
-            inline=False
-        )
-    
-    webhook.add_embed(embed)
-    webhook.execute()
+
+    # We only process the top 12 players to avoid Discord embed limits
+    for p in players[:12]:
+        last_5 = get_last_5_stats(p['name'])
+        
+        if last_5:
+            avg_5 = round(sum(last_5) / len(last_5), 1)
+            # Create a clean scouting embed
+            embed = DiscordEmbed(title=f"🏀 {p['name']} Scouting Report", color="3498DB")
+            embed.add_embed_field(name="Today's Line", value=f"**{p['line']} Points**", inline=True)
+            embed.add_embed_field(name="Last 5 Games (Raw)", value=f"`{last_5}`", inline=True)
+            embed.add_embed_field(name="L5 Average", value=f"**{avg_5}**", inline=True)
+            embed.set_footer(text=f"Matchup: {p['matchup']}")
+            
+            webhook.add_embed(embed)
+            
+            # Send in batches of 3 to avoid rate limits
+            if len(webhook.get_embeds()) >= 3:
+                webhook.execute()
+                webhook = DiscordWebhook(url=webhook_url)
+                time.sleep(2)
+        
+        # Respect BallDontLie Free Tier (5 requests/min)
+        time.sleep(12) 
 
 if __name__ == "__main__":
-    run_scout()
+    run_report()
