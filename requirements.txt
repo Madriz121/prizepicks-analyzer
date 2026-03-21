@@ -1,5 +1,2 @@
 requests
 discord-webhook
-nba_api
-pandas
-numpy
