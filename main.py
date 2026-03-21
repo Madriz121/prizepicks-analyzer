@@ -1,19 +1,20 @@
 import os
 import requests
 import time
-import random
 from discord_webhook import DiscordWebhook, DiscordEmbed
 
-def get_today_lines():
-    """Fetches the current Point lines for today's NBA games."""
+def get_market_lines():
+    """Fetches today's player point lines from DraftKings/PrizePicks."""
     api_key = os.getenv("THE_ODDS_API_KEY")
     url = "https://api.the-odds-api.com/v4/sports/basketball_nba/events"
     resp = requests.get(url, params={'apiKey': api_key})
+    
     if resp.status_code != 200: return []
-
-    all_lines = []
+    
     events = resp.json()
-    for e in events[:8]: # Check the first 8 games of the day
+    scout_list = []
+    
+    for e in events[:5]: # Scouting first 5 games to save API credits
         eid = e['id']
         prop_url = f"https://api.the-odds-api.com/v4/sports/basketball_nba/events/{eid}/odds"
         params = {'apiKey': api_key, 'regions': 'us', 'markets': 'player_points'}
@@ -25,71 +26,70 @@ def get_today_lines():
                 if book['key'] in ['draftkings', 'prizepicks']:
                     for market in book.get('markets', []):
                         for opt in market['outcomes']:
-                            all_lines.append({
+                            scout_list.append({
                                 'name': opt['description'],
                                 'line': float(opt['point']),
-                                'team': e['home_team'] if opt['description'] in str(e['home_team']) else e['away_team']
+                                'matchup': f"{e['away_team']} @ {e['home_team']}"
                             })
-        time.sleep(1) # Small delay to be nice to The-Odds-API
-    return all_lines
+        time.sleep(1)
+    return scout_list
 
-def get_historical_stats(player_name):
-    """Pulls last 10 games and calculates L5 and L10 averages."""
+def get_player_history(player_name, current_line):
+    """Checks last 5 games against TODAY'S line."""
     headers = {"Authorization": os.getenv("BDL_API_KEY", "")}
     try:
-        # Search Player
-        p_search = requests.get(f"https://api.balldontlie.io/v1/players?search={player_name}", headers=headers, timeout=10)
-        p_id = p_search.json()['data'][0]['id']
+        # 1. Get Player ID
+        p_search = requests.get(f"https://api.balldontlie.io/v1/players?search={player_name}", headers=headers).json()
+        if not p_search['data']: return None
+        p_id = p_search['data'][0]['id']
 
-        # Get Stats (2025-26 season is '2025' in BDL)
-        s_url = f"https://api.balldontlie.io/v1/stats?player_ids[]={p_id}&seasons[]=2025&per_page=10"
-        s_resp = requests.get(s_url, headers=headers, timeout=10)
-        games = s_resp.json().get('data', [])
+        # 2. Get Last 5 Stats (2025-26 season is '2025')
+        s_url = f"https://api.balldontlie.io/v1/stats?player_ids[]={p_id}&seasons[]=2025&per_page=5"
+        stats = requests.get(s_url, headers=headers).json().get('data', [])
         
-        if not games: return None
-        pts = [g['pts'] for g in games]
+        if not stats: return None
+        pts = [g['pts'] for g in stats]
+        
+        # 3. Calculate 'Hit Rate' vs today's line
+        overs = sum(1 for p in pts if p > current_line)
+        avg_5 = round(sum(pts) / len(pts), 1)
         
         return {
-            'avg_5': round(sum(pts[:5]) / 5, 1) if len(pts) >= 5 else None,
-            'avg_10': round(sum(pts) / len(pts), 1),
-            'last_5_raw': pts[:5]
+            'pts_log': pts,
+            'avg_5': avg_5,
+            'hit_rate': f"{overs}/5 Over",
+            'is_consistent': overs >= 4 or overs <= 1 # Flag if 80%+ consistent
         }
     except:
         return None
 
-def run_scouting_report():
-    players_to_check = get_today_lines()
-    flags = []
+def run_scout():
+    raw_players = get_market_lines()
+    interesting_plays = []
 
-    print(f"🔎 Scouting {len(players_to_check)} players...")
-    for p in players_to_check:
-        stats = get_historical_stats(p['name'])
-        if not stats or not stats['avg_5']: continue
-
-        # FLAG LOGIC: If L5 average is 3+ points away from the current line
-        diff = stats['avg_5'] - p['line']
-        if abs(diff) >= 3.0:
-            p.update(stats)
-            p['diff'] = round(diff, 1)
-            flags.append(p)
+    print(f"🔎 Scouting {len(raw_players)} lines...")
+    for p in raw_players:
+        history = get_player_history(p['name'], p['line'])
+        if history and history['is_consistent']:
+            p.update(history)
+            interesting_plays.append(p)
         
-        # Respect BDL Free Tier (5 requests/min)
-        time.sleep(12.5) 
+        # Slow down for BallDontLie Free Tier (5 requests/min)
+        time.sleep(12)
 
-    send_scouting_discord(flags)
+    send_to_discord(interesting_plays)
 
-def send_scouting_discord(flags):
+def send_to_discord(reports):
     webhook_url = os.getenv("DISCORD_WEBHOOK")
-    if not webhook_url or not flags: return
+    if not webhook_url or not reports: return
     
     webhook = DiscordWebhook(url=webhook_url)
-    embed = DiscordEmbed(title="🏀 Player Prop Scouting Report", color="3498DB")
+    embed = DiscordEmbed(title="📊 Player Prop Consistency Report", color="2ECC71")
     
-    for p in flags[:10]: # Send the top 10 most interesting flags
-        trend = "🔥 HOT" if p['diff'] > 0 else "❄️ COLD"
+    for r in reports[:10]: # Top 10 most consistent players
         embed.add_embed_field(
-            name=f"{p['name']} ({p['team']}) - Line: {p['line']}",
-            value=f"**Trend:** {trend} (Diff: {p['diff']})\n**L5 Avg:** {p['avg_5']} | **L10 Avg:** {p['avg_10']}\n**Recent:** {p['last_5_raw']}",
+            name=f"{r['name']} - Line: {r['line']}",
+            value=f"**Today's Matchup:** {r['matchup']}\n**Hit Rate:** {r['hit_rate']}\n**Last 5 Scores:** {r['pts_log']}\n**L5 Average:** {r['avg_5']}",
             inline=False
         )
     
@@ -97,4 +97,4 @@ def send_scouting_discord(flags):
     webhook.execute()
 
 if __name__ == "__main__":
-    run_scouting_report()
+    run_scout()
