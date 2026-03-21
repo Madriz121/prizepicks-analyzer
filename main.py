@@ -3,124 +3,98 @@ import requests
 import time
 import random
 from discord_webhook import DiscordWebhook, DiscordEmbed
-from nba_api.stats.static import players
 
-def get_nba_data():
+def get_today_lines():
+    """Fetches the current Point lines for today's NBA games."""
     api_key = os.getenv("THE_ODDS_API_KEY")
-    events_url = "https://api.the-odds-api.com/v4/sports/basketball_nba/events"
-    events_resp = requests.get(events_url, params={'apiKey': api_key})
-    if events_resp.status_code != 200: return []
+    url = "https://api.the-odds-api.com/v4/sports/basketball_nba/events"
+    resp = requests.get(url, params={'apiKey': api_key})
+    if resp.status_code != 200: return []
 
-    events = events_resp.json()
-    all_props = []
-    # Reduced to 5 games to stay under the radar
-    for e in events[:5]:
+    all_lines = []
+    events = resp.json()
+    for e in events[:8]: # Check the first 8 games of the day
         eid = e['id']
-        props_url = f"https://api.the-odds-api.com/v4/sports/basketball_nba/events/{eid}/odds"
-        params = {'apiKey': api_key, 'regions': 'us', 'markets': 'player_points', 'oddsFormat': 'american'}
-        resp = requests.get(props_url, params=params)
-        if resp.status_code == 200:
-            data = resp.json()
-            data.update({'home_team': e['home_team'], 'away_team': e['away_team']})
-            all_props.append(data)
-        time.sleep(1.5) 
-    return all_props
-
-def fetch_from_balldontlie(player_name):
-    """Fallback if NBA.com blocks us."""
-    try:
-        # Search for player
-        search_r = requests.get(f"https://api.balldontlie.io/v1/players?search={player_name}", timeout=10)
-        p_data = search_r.json().get('data')
-        if not p_data: return None
-        p_id = p_data[0]['id']
-
-        # Get stats (2025 season)
-        stats_r = requests.get(f"https://api.balldontlie.io/v1/stats?player_ids[]={p_id}&seasons[]=2025&per_page=5", timeout=10)
-        games = stats_r.json().get('data', [])
-        if not games: return None
+        prop_url = f"https://api.the-odds-api.com/v4/sports/basketball_nba/events/{eid}/odds"
+        params = {'apiKey': api_key, 'regions': 'us', 'markets': 'player_points'}
+        p_resp = requests.get(prop_url, params=params)
         
+        if p_resp.status_code == 200:
+            data = p_resp.json()
+            for book in data.get('bookmakers', []):
+                if book['key'] in ['draftkings', 'prizepicks']:
+                    for market in book.get('markets', []):
+                        for opt in market['outcomes']:
+                            all_lines.append({
+                                'name': opt['description'],
+                                'line': float(opt['point']),
+                                'team': e['home_team'] if opt['description'] in str(e['home_team']) else e['away_team']
+                            })
+        time.sleep(1) # Small delay to be nice to The-Odds-API
+    return all_lines
+
+def get_historical_stats(player_name):
+    """Pulls last 10 games and calculates L5 and L10 averages."""
+    headers = {"Authorization": os.getenv("BDL_API_KEY", "")}
+    try:
+        # Search Player
+        p_search = requests.get(f"https://api.balldontlie.io/v1/players?search={player_name}", headers=headers, timeout=10)
+        p_id = p_search.json()['data'][0]['id']
+
+        # Get Stats (2025-26 season is '2025' in BDL)
+        s_url = f"https://api.balldontlie.io/v1/stats?player_ids[]={p_id}&seasons[]=2025&per_page=10"
+        s_resp = requests.get(s_url, headers=headers, timeout=10)
+        games = s_resp.json().get('data', [])
+        
+        if not games: return None
         pts = [g['pts'] for g in games]
-        return round(sum(pts) / len(pts), 1)
+        
+        return {
+            'avg_5': round(sum(pts[:5]) / 5, 1) if len(pts) >= 5 else None,
+            'avg_10': round(sum(pts) / len(pts), 1),
+            'last_5_raw': pts[:5]
+        }
     except:
         return None
 
-def get_last_5_pts_avg(player_name):
-    """Main fetch with Anti-Bot protection."""
-    try:
-        search = players.find_players_by_full_name(player_name)
-        if not search: return None
-        p_id = search[0]['id']
+def run_scouting_report():
+    players_to_check = get_today_lines()
+    flags = []
 
-        # Rotate headers to look human
-        headers = {
-            'Host': 'stats.nba.com',
-            'User-Agent': random.choice([
-                'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36',
-                'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/121.0.0.0 Safari/537.36'
-            ]),
-            'Accept': 'application/json, text/plain, */*',
-            'Referer': 'https://www.nba.com/',
-            'Connection': 'keep-alive'
-        }
+    print(f"🔎 Scouting {len(players_to_check)} players...")
+    for p in players_to_check:
+        stats = get_historical_stats(p['name'])
+        if not stats or not stats['avg_5']: continue
 
-        # URL for the direct JSON endpoint (more reliable than the library wrapper)
-        url = f"https://stats.nba.com/stats/playergamelog?PlayerID={p_id}&Season=2025-26&SeasonType=Regular Season"
+        # FLAG LOGIC: If L5 average is 3+ points away from the current line
+        diff = stats['avg_5'] - p['line']
+        if abs(diff) >= 3.0:
+            p.update(stats)
+            p['diff'] = round(diff, 1)
+            flags.append(p)
         
-        # STRICT 10s TIMEOUT - prevents the "Stuck" issue
-        resp = requests.get(url, headers=headers, timeout=10)
-        
-        if resp.status_code == 200:
-            rows = resp.json()['resultSets'][0]['rowSet']
-            pts = [row[24] for row in rows[:5]] # 24 is the PTS index
-            return round(sum(pts)/len(pts), 1)
-        else:
-            return fetch_from_balldontlie(player_name)
-    except:
-        return fetch_from_balldontlie(player_name)
+        # Respect BDL Free Tier (5 requests/min)
+        time.sleep(12.5) 
 
-def build_slips(data):
-    pool = []
-    print("🏀 Scanning for Point Discrepancies...")
-    for game in data:
-        for book in game.get('bookmakers', []):
-            if book['key'] in ['draftkings', 'prizepicks']:
-                for market in book.get('markets', []):
-                    for opt in market['outcomes']:
-                        name, line = opt['description'], float(opt['point'])
-                        avg = get_last_5_pts_avg(name)
-                        
-                        if avg and abs(avg - line) >= 2.0:
-                            pool.append({'name': name, 'line': line, 'avg': avg, 'diff': round(avg - line, 1), 'pick': 'MORE' if avg > line else 'LESS'})
-                        time.sleep(random.uniform(2, 4)) # Jittered delay to bypass bots
+    send_scouting_discord(flags)
 
-    # Filter and sort by highest confidence (biggest diff)
-    pool.sort(key=lambda x: abs(x['diff']), reverse=True)
-    
-    slips = []
-    used = set()
-    for size in [3, 2]: # Prioritize smaller, safer slips
-        current = []
-        for p in pool:
-            if p['name'] not in used and len(current) < size:
-                current.append(p)
-                used.add(p['name'])
-        if len(current) == size: slips.append(current)
-    return slips
-
-def alert_discord(slips):
+def send_scouting_discord(flags):
     webhook_url = os.getenv("DISCORD_WEBHOOK")
-    if not webhook_url or not slips: return
+    if not webhook_url or not flags: return
+    
     webhook = DiscordWebhook(url=webhook_url)
-    for i, slip in enumerate(slips[:3]):
-        embed = DiscordEmbed(title=f"🔥 Points Trend Slip #{i+1}", color="E74C3C")
-        for p in slip:
-            embed.add_embed_field(name=f"{p['name']}", value=f"**{p['pick']} {p['line']}** (Avg: {p['avg']})", inline=True)
-        webhook.add_embed(embed)
-        webhook.execute()
-        webhook = DiscordWebhook(url=webhook_url)
+    embed = DiscordEmbed(title="🏀 Player Prop Scouting Report", color="3498DB")
+    
+    for p in flags[:10]: # Send the top 10 most interesting flags
+        trend = "🔥 HOT" if p['diff'] > 0 else "❄️ COLD"
+        embed.add_embed_field(
+            name=f"{p['name']} ({p['team']}) - Line: {p['line']}",
+            value=f"**Trend:** {trend} (Diff: {p['diff']})\n**L5 Avg:** {p['avg_5']} | **L10 Avg:** {p['avg_10']}\n**Recent:** {p['last_5_raw']}",
+            inline=False
+        )
+    
+    webhook.add_embed(embed)
+    webhook.execute()
 
 if __name__ == "__main__":
-    raw = get_nba_data()
-    final_slips = build_slips(raw)
-    alert_discord(final_slips)
+    run_scouting_report()
